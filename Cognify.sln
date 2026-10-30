@@ -1,0 +1,52 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{365EE0A4-D07C-4E3E-A58A-AE35344850A7}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Cognify", "src\Cognify\Cognify.csproj", "{DF341F59-F87B-4391-92AF-4ECA711CC232}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "demo", "demo", "{FF50503A-BDA2-4AAC-AD5F-E3C6FC78352D}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Cognify.Demo", "demo\Cognify.Demo\Cognify.Demo.csproj", "{9E54B0AE-1EBD-4CFD-947F-21D9818B6BD2}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{9EA94C1D-3C2F-48BD-88D7-4F8DEDCE9A85}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Cognify.Tests", "tests\Cognify.Tests\Cognify.Tests.csproj", "{4CB3EF5E-6BB7-4078-B627-5A5D46D54BD1}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Cognify.Yume", "demo\Cognify.Yume\Cognify.Yume.csproj", "{7366B7B0-B34D-46E7-A729-4EEA1117E264}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{DF341F59-F87B-4391-92AF-4ECA711CC232}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{DF341F59-F87B-4391-92AF-4ECA711CC232}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{DF341F59-F87B-4391-92AF-4ECA711CC232}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{DF341F59-F87B-4391-92AF-4ECA711CC232}.Release|Any CPU.Build.0 = Release|Any CPU
+		{9E54B0AE-1EBD-4CFD-947F-21D9818B6BD2}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{9E54B0AE-1EBD-4CFD-947F-21D9818B6BD2}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{9E54B0AE-1EBD-4CFD-947F-21D9818B6BD2}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{9E54B0AE-1EBD-4CFD-947F-21D9818B6BD2}.Release|Any CPU.Build.0 = Release|Any CPU
+		{4CB3EF5E-6BB7-4078-B627-5A5D46D54BD1}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{4CB3EF5E-6BB7-4078-B627-5A5D46D54BD1}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{4CB3EF5E-6BB7-4078-B627-5A5D46D54BD1}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{4CB3EF5E-6BB7-4078-B627-5A5D46D54BD1}.Release|Any CPU.Build.0 = Release|Any CPU
+		{7366B7B0-B34D-46E7-A729-4EEA1117E264}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{7366B7B0-B34D-46E7-A729-4EEA1117E264}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{7366B7B0-B34D-46E7-A729-4EEA1117E264}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{7366B7B0-B34D-46E7-A729-4EEA1117E264}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{DF341F59-F87B-4391-92AF-4ECA711CC232} = {365EE0A4-D07C-4E3E-A58A-AE35344850A7}
+		{9E54B0AE-1EBD-4CFD-947F-21D9818B6BD2} = {FF50503A-BDA2-4AAC-AD5F-E3C6FC78352D}
+		{4CB3EF5E-6BB7-4078-B627-5A5D46D54BD1} = {9EA94C1D-3C2F-48BD-88D7-4F8DEDCE9A85}
+		{7366B7B0-B34D-46E7-A729-4EEA1117E264} = {FF50503A-BDA2-4AAC-AD5F-E3C6FC78352D}
+	EndGlobalSection
+EndGlobal
