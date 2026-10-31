@@ -677,9 +677,20 @@ public sealed class Mind : IDisposable
     /// next-token language model. Words from the query are marked as spoken
     /// so the mind stops asking what they mean.
     ///
+    /// Then she READS INTO the web (when <c>WebExploration.ExploreResults</c>
+    /// is on, the default): the most query-relevant result page is opened,
+    /// its readable text — not the 140-character snippet — feeds memories,
+    /// facts and the language models, and when that page is a poor match the
+    /// explorer steps through the in-page link that matches the query best
+    /// (a site's front door becomes the actual article). A search result is
+    /// only a doorway; this is what stops her from being locked to the
+    /// search engine's snippets.
+    ///
     /// This is deliberately the ONLY path to web search: the tool is
     /// manual-only and never auto-fires inside the cognitive cycle, so the
-    /// mind goes online exactly when asked — never on its own.
+    /// mind goes online exactly when asked — never on its own. Reading one
+    /// page further is part of the same consent: the user asked for the
+    /// lookup, the page IS the lookup.
     /// Throws <see cref="MindConfigurationException"/> when tools are
     /// disabled and the mind is not lenient; in lenient mode a failed result
     /// is returned instead.
@@ -705,8 +716,72 @@ public sealed class Mind : IDisposable
 
         var result = tools.Invoke("web-search",
             new Dictionary<string, string> { ["query"] = query.Trim() }, query);
-        if (result.Success)
-            LearnFromWeb(query.Trim(), result);
+        if (!result.Success)
+            return result;
+
+        LearnFromWeb(query.Trim(), result);
+
+        // Read INTO the results: open the best-matching page and learn from
+        // the page itself. Failures here must not fail the search — the
+        // results are already in.
+        if (Config.Tools.WebExploration.ExploreResults)
+        {
+            var (section, pages) = ExploreResultsFor(query.Trim(), result);
+            if (section.Length > 0)
+            {
+                LearnFromPages(pages, query.Trim());
+                Stream?.Add("web", $"read into {pages.Count} page(s) the search pointed at and learned from their text");
+                var data = new Dictionary<string, object>(result.Data) { ["pages"] = pages };
+                return Cognify.Tools.ToolResult.Ok(result.Output + section, data);
+            }
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Explicit web exploration: opens ONE page and reads it — the readable
+    /// text of the page itself (scripts, styles and site chrome stripped),
+    /// not a search snippet — and learns from it: memories, knowledge-base
+    /// facts, both language models. When the exploration options allow, the
+    /// reader steps through an in-page link that better matches what the
+    /// user asked for. This is the direct "read that site" path, so the mind
+    /// is never locked to a search engine's result list.
+    ///
+    /// Manual-only by construction: nothing in the cognitive cycle calls
+    /// this — the mind opens pages exactly when asked, never on its own.
+    /// Throws <see cref="MindConfigurationException"/> when tools are
+    /// disabled and the mind is not lenient; in lenient mode a failed result
+    /// is returned instead.
+    /// </summary>
+    public Cognify.Tools.ToolResult ExploreWeb(string url)
+    {
+        if (string.IsNullOrWhiteSpace(url))
+            return Cognify.Tools.ToolResult.Fail("No page address given. Usage: /explore <url>.");
+        var tools = Tools;
+        if (tools is null)
+        {
+            if (!Config.LenientMode)
+                throw new MindConfigurationException("Tool use is not enabled; enable it with WithTools() or WithWebSearch().");
+            return Cognify.Tools.ToolResult.Fail(
+                "Web exploration is not enabled (lenient mode: no page was opened).");
+        }
+
+        // Restored minds may predate the web-explore registration — make sure
+        // the tool exists before invoking it.
+        if (tools.Registry.Get("web-explore") is null)
+            tools.Registry.Register(new Cognify.Tools.WebExploreTool(
+                Config.Tools.WebPageFetcher as Cognify.Tools.IWebPageFetcher,
+                Config.Tools.WebExploration));
+
+        var result = tools.Invoke("web-explore",
+            new Dictionary<string, string> { ["url"] = url.Trim() }, url);
+        if (result.Success &&
+            result.Data.TryGetValue("pages", out var raw) &&
+            raw is IReadOnlyList<Cognify.Tools.WebPage> pages && pages.Count > 0)
+        {
+            LearnFromPages(pages, "");
+            Stream?.Add("web", $"read the page {Truncate(pages[0].Url, 60)} and learned from its text");
+        }
         return result;
     }
 
@@ -759,6 +834,138 @@ public sealed class Mind : IDisposable
                     lex.MarkSpoken(word);
 
         Stream?.Add("web", $"searched the web for: {Truncate(query, 60)} and learned from the results");
+    }
+
+    // Cached reader: one HttpClient-backed explorer per mind (re-created only
+    // if a custom fetcher is assigned after first use).
+    private Cognify.Tools.WebExplorer? _webExplorer;
+
+    private Cognify.Tools.WebExplorer WebExplorerInstance() =>
+        _webExplorer ??= new Cognify.Tools.WebExplorer(
+            Config.Tools.WebPageFetcher as Cognify.Tools.IWebPageFetcher,
+            Config.Tools.WebExploration);
+
+    /// <summary>
+    /// Opens the search results' most query-relevant page (and, when the
+    /// options allow, follows a more relevant in-page link) and returns the
+    /// report section for the chat plus the pages read. Candidates are tried
+    /// in relevance order — if the first page turns out not to mention the
+    /// query at all, the next best result gets the chance, so a brand-dominated
+    /// SERP ("wikipedia flowers") cannot make the actual topic vanish.
+    /// </summary>
+    private (string Section, IReadOnlyList<Cognify.Tools.WebPage> Pages) ExploreResultsFor(
+        string query, Cognify.Tools.ToolResult result)
+    {
+        var results = result.Data.TryGetValue("results", out var raw) &&
+                      raw is IReadOnlyList<Cognify.Tools.WebSearchResult> list
+            ? list
+            : null;
+        if (results is null || results.Count == 0)
+            return ("", Array.Empty<Cognify.Tools.WebPage>());
+
+        var keywords = Cognify.Tools.WebRelevance.Keywords(query);
+        var explorer = WebExplorerInstance();
+        Cognify.Tools.WebExploration? fallback = null;
+
+        foreach (var candidate in Cognify.Tools.WebRelevance.RankResults(query, results).Take(2))
+        {
+            try
+            {
+                var exploration = explorer.Explore(query, candidate.Url);
+                if (exploration.CombinedText.Length == 0)
+                    continue;
+                if (keywords.Count == 0 ||
+                    keywords.Any(kw => Cognify.Tools.WebRelevance.Has(exploration.CombinedText, kw)))
+                    return (ExplorationSection(query, exploration), exploration.Pages);
+                fallback ??= exploration;   // readable, but does not mention the topic — keep as backup
+            }
+            catch (Cognify.Tools.WebSearchException)
+            {
+                // This candidate is unreadable (bot-check, PDF, offline page) —
+                // the next result gets the chance.
+            }
+        }
+        return fallback is null
+            ? ("", Array.Empty<Cognify.Tools.WebPage>())
+            : (ExplorationSection(query, fallback), fallback.Pages);
+    }
+
+    /// <summary>The "I also read into ..." chat section for an exploration.</summary>
+    private static string ExplorationSection(string query, Cognify.Tools.WebExploration exploration)
+    {
+        var keywords = Cognify.Tools.WebRelevance.Keywords(query);
+        var lines = new List<string> { "", "I also read into the most relevant page to learn more:" };
+        foreach (var page in exploration.Pages)
+        {
+            var host = HostOf(page.Url);
+            var title = page.Title.Length > 0 ? Truncate(page.Title, 90) : host;
+            lines.Add($" • {title} ({host})");
+            var highlight = Cognify.Tools.WebRelevance.KeySentences(page.Text, keywords, 1, 200);
+            var preview = highlight.Count > 0
+                ? highlight[0]
+                : Truncate(page.Text.Replace('\n', ' '), 160);
+            if (preview.Length > 0)
+                lines.Add($"   {preview}");
+        }
+        return string.Join("\n", lines);
+    }
+
+    /// <summary>
+    /// Learns from pages she actually read: query-relevant highlights become
+    /// recallable memories, clean factual sentences become knowledge-base
+    /// facts (source "web"), the full readable text feeds both language
+    /// models, and the query's words count as spoken (she looked them up).
+    /// </summary>
+    private void LearnFromPages(IReadOnlyList<Cognify.Tools.WebPage> pages, string query)
+    {
+        var keywords = Cognify.Tools.WebRelevance.Keywords(query);
+
+        // 1. Recallable memories — she remembers what the pages said.
+        foreach (var page in pages.Take(2))
+        {
+            var highlights = Cognify.Tools.WebRelevance.KeySentences(page.Text, keywords, 2, 240);
+            var gist = highlights.Count > 0
+                ? string.Join(" ", highlights)
+                : Truncate(page.Text.Replace('\n', ' '), 180);
+            Memory?.Remember(
+                $"Web page: {Truncate(page.Title, 80)}. {gist} (source: {page.Url})",
+                MemoryKind.LongTerm, importance: 0.65, source: "web");
+        }
+
+        // 2. Knowledge: clean factual sentences on the page become facts.
+        if (Reasoning is { } reasoning)
+        {
+            int added = 0;
+            foreach (var page in pages)
+            {
+                foreach (var sentence in Cognify.Tools.WebRelevance.KeySentences(page.Text, keywords, 8, 700))
+                {
+                    foreach (var fact in FactParser.Parse(sentence))
+                    {
+                        var sourced = new Fact(fact.Subject, fact.Predicate, fact.Object,
+                            Math.Min(fact.Confidence, 0.7), "web");
+                        if (reasoning.Knowledge.Add(sourced))
+                            added++;
+                        if (added >= 3) break;
+                    }
+                    if (added >= 3) break;
+                }
+                if (added >= 3) break;
+            }
+        }
+
+        // 3. Language + vocabulary: the page text feeds the language models.
+        ObserveLanguage(string.Join("\n", pages.Select(p => p.Text)));
+        if (query.Length > 0 && Lexicon is { } lex)
+            foreach (var word in Emotions.MoodEngine.Tokenize(query))
+                if (word.Length > 2)
+                    lex.MarkSpoken(word);
+    }
+
+    private static string HostOf(string url)
+    {
+        try { return new Uri(url).Host; }
+        catch (UriFormatException) { return url; }
     }
 
     // ------------------------------------------------------------------

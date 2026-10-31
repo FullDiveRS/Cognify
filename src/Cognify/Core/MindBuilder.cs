@@ -413,13 +413,17 @@ public sealed class MindBuilder
         int seed = _config.Learning.Seed;
         var mind = new Mind(_config, modules, seed);
 
-        // Register the manual-only web-search tool when enabled. It is
+        // Register the manual-only web tools when enabled. They are
         // explicitly NOT auto-invocable — see WebSearchTool.ManualOnly.
-        if (_config.Tools.AllowWebSearch && mind.Tools is { } tools &&
-            tools.Registry.Get("web-search") is null)
+        if (_config.Tools.AllowWebSearch && mind.Tools is { } tools)
         {
-            tools.Registry.Register(new Cognify.Tools.WebSearchTool(
-                _config.Tools.WebSearchBackend as Cognify.Tools.IWebSearchBackend));
+            if (tools.Registry.Get("web-search") is null)
+                tools.Registry.Register(new Cognify.Tools.WebSearchTool(
+                    _config.Tools.WebSearchBackend as Cognify.Tools.IWebSearchBackend));
+            if (tools.Registry.Get("web-explore") is null)
+                tools.Registry.Register(new Cognify.Tools.WebExploreTool(
+                    _config.Tools.WebPageFetcher as Cognify.Tools.IWebPageFetcher,
+                    _config.Tools.WebExploration));
         }
 
         if (_config.Persistence.SqlitePath is { } path)

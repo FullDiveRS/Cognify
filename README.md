@@ -1,5 +1,3 @@
-## Note: this project was made by GLM 5.3-flash, You may use it to study, build or modify code as long as the Project retains the MIT LICENSE
-----------------------------------------------------------------------------------
 # Cognify
 
 **A cognitive architecture library for .NET 8** — build AI models that can *reason, think, learn by themselves, feel emotions, remember, pursue goals, have a personality* — and that can also **see, hear, understand languages, embed meaning, use tools, write and analyze code, and generate media**.
@@ -469,14 +467,37 @@ The `web-search` tool gives the mind the internet, with a hard guard: **it is ma
 
 ```csharp
 var mind = MindBuilder.Create("Yume")
-    .WithWebSearch()                       // registers web-search (DuckDuckGo HTTP backend)
+    .WithWebSearch()                       // registers web-search (multi-engine HTTP chain)
     .Build();
 var result = mind.SearchWeb("what is a quokka");   // the ONLY way she touches the internet
 ```
 
 When the search succeeds she LEARNS from it: snippets become recallable long-term memories, clean "X is Y" sentences become knowledge-base facts (source "web"), the text feeds the next-token model, and the query's words count as known — she looked them up instead of asking what they mean. When it fails (offline, blocked, engine layout change), she says so cleanly: "I could not search the web for ...: web search could not complete (...). Web search needs an internet connection — try again, or teach me directly." The search retries once and enforces a timeout, so a flaky network turns into a message instead of a hang. Plug in your own backend (Bing, SerpAPI, a local index) via `Tools.WebSearchBackend = myIWebSearchBackend`.
 
-The demo exposes it as the `/searchweb <query>` slash command — see below.
+### Web exploration — she reads INTO the pages
+A search result is only a doorway: a snippet is 140 characters, and a brand-dominated SERP ("wikipedia flowers") can push the actual topic right out of view. So after a successful search she **opens the most query-relevant result and reads the page itself** (`Cognify.Tools.WebExplorer`) — scripts, styles and site chrome stripped, thousands of characters of readable text — and learns from what she read: memories, knowledge-base facts, both language models. If the first page turns out not to mention the topic at all, the next best result gets its chance; and when the page she lands on is a site's front door, she may **follow the in-page link that matches the query best** — the front door becomes the actual article. The chat report tells you exactly what she read:
+
+```
+Here is what I found on the web for "flowers":
+ 1. ... (www.ftd.com)
+ ...
+I also read into the most relevant page to learn more:
+ • Flower - Wikipedia (en.wikipedia.org)
+   A flower is the reproductive structure of flowering plants...
+```
+
+Reading one page further is part of the same consent — the user asked for the lookup, the page IS the lookup. It stays bounded (`WebExplorationOptions`), it never fires on its own, and you can shape it fluently:
+
+```csharp
+.WithWebSearch(t => t.Exploration(e => e.Explore(true)    // dig into results (default on)
+                                     .Follow(true)        // follow a better in-page link (default on)
+                                     .Pages(2)            // max pages per exploration (1..4)
+                                     .Budget(4000)))      // readable-text budget per page
+```
+
+For "go read THAT site", there is a second manual-only tool: `mind.ExploreWeb(url)` opens any page directly (scheme-less addresses get `https://` for free), reads it, and learns the same way. Swap the fetcher (fixtures in tests, a caching proxy) via `Tools.WebPageFetcher = myIWebPageFetcher`; both the exploration settings and the fetcher ride along in the persisted config.
+
+The demo exposes both as `/searchweb <query>` and `/explore <url>` slash commands — see below.
 
 ### Taught arithmetic — reasoning instead of a calculator
 The mind learns arithmetic the way a child does: from what it is **taught**, and it reasons with that knowledge. The calculator is a crutch it does not need for anything you taught it — it only steps in when reasoning comes up empty (or when you explicitly ask for it).
@@ -581,7 +602,9 @@ dotnet run --project demo/Cognify.Yume -- --train corpus/words-and-meanings.txt 
 #   /teach <sentence>                   # teach facts line-by-line
 #   /train <file>                       # bulk-train a corpus file
 #   /searchweb <query>                  # EXPLICIT web search — she only goes
-#                                       # online when YOU type this, never on her own
+#                                       # online when YOU type this, never on her own;
+#                                       # she then READS INTO the best result page
+#   /explore <url>                      # open any web page and read it (manual-only)
 #   /improve                            # run a self-improvement review pass
 #   /predict <text>                     # her next-token predictions after your
 #                                       # words (hybrid: n-gram + transformer)

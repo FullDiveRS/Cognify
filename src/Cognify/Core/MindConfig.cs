@@ -528,6 +528,20 @@ public sealed class ToolOptions
     /// </summary>
     public object? WebSearchBackend { get; set; }
 
+    /// <summary>
+    /// Optional custom page fetcher for web exploration. Assign an
+    /// <c>Cognify.Tools.IWebPageFetcher</c> to replace the default HTTP
+    /// fetcher (e.g. fixtures in tests, a caching proxy, an intranet mirror).
+    /// </summary>
+    public object? WebPageFetcher { get; set; }
+
+    /// <summary>
+    /// How far the mind reads INTO the web: after a search she opens the most
+    /// relevant result and learns from the page itself (not just the snippet),
+    /// and <c>/explore &lt;url&gt;</c> visits any page directly.
+    /// </summary>
+    public WebExplorationOptions WebExploration { get; set; } = new();
+
     /// <summary>Phrases that signal a tool request (matched case-insensitively).</summary>
     public List<string> InvokeTriggers { get; set; } = new()
     {
@@ -541,6 +555,57 @@ public sealed class ToolOptions
 
     /// <summary>Fluent setter: <see cref="AllowWebSearch"/>.</summary>
     public ToolOptions WebSearch(bool value) { AllowWebSearch = value; return this; }
+
+    /// <summary>Fluent setter for <see cref="WebExploration"/> (e.g. <c>t.Exploration(e =&gt; e.Follow(false))</c>).</summary>
+    public ToolOptions Exploration(Action<WebExplorationOptions> configure)
+    {
+        configure(WebExploration);
+        return this;
+    }
+}
+
+/// <summary>
+/// How far the mind reads INTO the web. A search result is only a doorway:
+/// when exploration is on, the mind opens the most relevant result and learns
+/// from the page's actual text (thousands of characters, not a 140-character
+/// snippet), and — when allowed — steps through an in-page link to even more
+/// relevant ground. That is what stops her from being "locked to bing.com":
+/// the SERP only decides where she starts reading.
+/// </summary>
+public sealed class WebExplorationOptions
+{
+    /// <summary>
+    /// After a successful search, open the most relevant result page and learn
+    /// from its readable text. On by default — search is already an explicit
+    /// user action, so reading one page further stays within the same consent.
+    /// </summary>
+    public bool ExploreResults { get; set; } = true;
+
+    /// <summary>
+    /// When the opened page is a poor match for the query, the explorer may
+    /// follow the in-page link whose anchor text / url matches the query best
+    /// (one step per page, up to <see cref="MaxPages"/>). This is how a hit on
+    /// a site's front door turns into the actual article about the topic.
+    /// </summary>
+    public bool FollowLinks { get; set; } = true;
+
+    /// <summary>Maximum number of pages read per exploration (1..4, default 2).</summary>
+    public int MaxPages { get; set; } = 2;
+
+    /// <summary>Readable-text budget per page, in characters (default 4000).</summary>
+    public int MaxPageChars { get; set; } = 4000;
+
+    /// <summary>Fluent setter: <see cref="ExploreResults"/>.</summary>
+    public WebExplorationOptions Explore(bool value) { ExploreResults = value; return this; }
+
+    /// <summary>Fluent setter: <see cref="FollowLinks"/>.</summary>
+    public WebExplorationOptions Follow(bool value) { FollowLinks = value; return this; }
+
+    /// <summary>Fluent setter: <see cref="MaxPages"/> (clamped to 1..4).</summary>
+    public WebExplorationOptions Pages(int value) { MaxPages = Math.Clamp(value, 1, 4); return this; }
+
+    /// <summary>Fluent setter: <see cref="MaxPageChars"/> (clamped to 400..20000).</summary>
+    public WebExplorationOptions Budget(int value) { MaxPageChars = Math.Clamp(value, 400, 20000); return this; }
 }
 
 /// <summary>Options for the code module.</summary>

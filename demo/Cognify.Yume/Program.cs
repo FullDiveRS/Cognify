@@ -26,9 +26,12 @@ using Cognify.Tools;
 //    /train <file>          bulk-train a corpus file (images work too —
 //                           she reads the words out of a text image!)
 //    /look <image>          read an image without training on it
-//    /searchweb <query>     explicit web search — she looks it up, learns
-//                           from the results, and reports back. Web search is
-//                           manual-only: she NEVER goes online unprompted.
+//    /searchweb <query>     explicit web search — she looks it up, then READS
+//                           INTO the most relevant result (the page itself,
+//                           not the snippet) and learns from it. Web search
+//                           is manual-only: she NEVER goes online unprompted.
+//    /explore <url>         open a specific page (any site!) and read it —
+//                           she is not locked to a search engine's results.
 //    /improve               run a self-improvement review pass
 //    /predict <text>        her next-token prediction after your words
 //                           (hybrid: n-gram statistics + her transformer)
@@ -65,10 +68,15 @@ if (File.Exists(DbPath))
     yume = MindBuilder.Restore(DbPath);
     firstActivation = false;
     // Restored minds predate per-version capability wiring: make sure the
-    // manual-only web-search tool exists so /searchweb always works.
+    // manual-only web tools exist so /searchweb and /explore always work.
     yume.Config.Tools.AllowWebSearch = true;
-    if (yume.Tools is { } tools && tools.Registry.Get("web-search") is null)
-        tools.Registry.Register(new WebSearchTool());
+    if (yume.Tools is { } tools)
+    {
+        if (tools.Registry.Get("web-search") is null)
+            tools.Registry.Register(new WebSearchTool());
+        if (tools.Registry.Get("web-explore") is null)
+            tools.Registry.Register(new WebExploreTool(null, yume.Config.Tools.WebExploration));
+    }
     Console.WriteLine($"[Yume re-awakened. Cycle #{yume.CycleCount} — she remembers you.]");
     Console.WriteLine($"[{yume.Knowledge?.FactCount ?? 0} facts, " +
                       $"{(yume.Memory is { } mem ? mem.Counts.ShortTerm + mem.Counts.LongTerm + mem.Counts.Episodic : 0)} memories, " +
@@ -433,7 +441,8 @@ bool HandleSlash(string input, Mind mind)
             Console.WriteLine("  /teach <sentence>      teach her facts line-by-line");
             Console.WriteLine("  /train <file>          bulk-train a corpus file (or a text image!)");
             Console.WriteLine("  /look <image>          read the text in an image without training");
-            Console.WriteLine("  /searchweb <query>     explicit web search (she never searches on her own)");
+            Console.WriteLine("  /searchweb <query>     explicit web search — she reads INTO the best result page");
+            Console.WriteLine("  /explore <url>         open any web page and read it (she learns from the text)");
             Console.WriteLine("  /improve               run a self-improvement review pass");
             Console.WriteLine("  /predict <text>        show her next-token predictions after your words");
             Console.WriteLine("  /trainbrain [epochs]   deep-train her transformer language model");
@@ -488,7 +497,7 @@ bool HandleSlash(string input, Mind mind)
             if (result.Success)
             {
                 Console.WriteLine($"Yume : {result.Output.Replace("\\n", $"{Environment.NewLine}       ")}");
-                Console.WriteLine("       [learned from the results: memories stored, clean facts added, next-token model updated]");
+                Console.WriteLine("       [learned from the results and the pages she read: memories stored, clean facts added, next-token model updated]");
             }
             else
             {
@@ -498,6 +507,19 @@ bool HandleSlash(string input, Mind mind)
         }
         case "/searchweb" or "/search":
             Console.WriteLine("[usage: /searchweb <what to look up>]");
+            return false;
+
+        case "/explore" or "/visit" or "/read" when rest.Length > 0:
+        {
+            Console.WriteLine($"[opening {rest} — she only reads pages you point her at, never on her own]");
+            var result = mind.ExploreWeb(rest);
+            Console.WriteLine($"Yume : {result.Output.Replace("\\n", $"{Environment.NewLine}       ")}");
+            if (result.Success)
+                Console.WriteLine("       [learned from the page: memories stored, clean facts added, next-token model updated]");
+            return false;
+        }
+        case "/explore" or "/visit" or "/read":
+            Console.WriteLine("[usage: /explore <url> — e.g. /explore en.wikipedia.org/wiki/Flower]");
             return false;
 
         case "/look" when rest.Length > 0:
