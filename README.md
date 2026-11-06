@@ -1,3 +1,5 @@
+## This library was made using GLM-5.3-flash, You may use it, study and fork it as long as the project keeps the MIT License
+
 # Cognify
 
 **A cognitive architecture library for .NET 8** — build AI models that can *reason, think, learn by themselves, feel emotions, remember, pursue goals, have a personality* — and that can also **see, hear, understand languages, embed meaning, use tools, write and analyze code, and generate media**.
