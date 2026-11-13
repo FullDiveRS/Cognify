@@ -2,6 +2,8 @@
 
 # Cognify
 
+## looking for the Python Version? check it out here -> https://github.com/FullDiveRS/CognifyPy
+
 **A cognitive architecture library for .NET 8** — build AI models that can *reason, think, learn by themselves, feel emotions, remember, pursue goals, have a personality* — and that can also **see, hear, understand languages, embed meaning, use tools, write and analyze code, and generate media**.
 
 Cognify gives you a `Mind`: a central cognitive kernel surrounded by **pluggable cognitive modules**. You decide which capabilities your AI gets, configure them fluently, watch them work through a fully explainable chain of thought, and persist the entire mind (knowledge, memories, emotions, personality, semantic vectors, even the trained neural network) to SQLite.
