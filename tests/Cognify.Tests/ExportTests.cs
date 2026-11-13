@@ -196,47 +196,26 @@ public class ExportTests : IDisposable
         string path = Path.Combine(_dir, "yume.gguf");
         MindExporter.ExportGguf(mind, path);
 
-        // Fully walk the file like gguf-py would.
-        using var fs = File.OpenRead(path);
-        using var r = new BinaryReader(fs);
+        // Verify with the strict in-library reader (the same checks llama.cpp
+        // performs on load: relative aligned offsets, data inside the file).
+        var gguf = new GgufReader(path);
 
-        Assert.Equal(0x46554747u, r.ReadUInt32());
-        Assert.Equal(3u, r.ReadUInt32());
-        ulong tensorCount = r.ReadUInt64();
-        ulong kvCount = r.ReadUInt64();
+        Assert.Equal(6, gguf.Tensors.Count); // w1, b1, w2, b2, q_values, q_counts
+        Assert.True(gguf.Metadata.Count >= 10);
 
-        Assert.Equal(6, (int)tensorCount); // w1, b1, w2, b2, q_values, q_counts
-        Assert.True(kvCount >= 10);
-
-        for (ulong i = 0; i < kvCount; i++)
+        long next = 0;
+        foreach (var info in gguf.Tensors)
         {
-            string key = ReadString(r);
-            var type = (GgufValueType)r.ReadUInt32();
-            Assert.True(Enum.IsDefined(type), $"KV '{key}' has undefined type {type}.");
-            ReadGgufValue(r, type); // must consume exactly one value
+            Assert.Equal(GgmlType.F32, info.GgmlType);
+            Assert.True(info.Offset >= next,
+                $"Tensor '{info.Name}' offset {info.Offset} overlaps previous tensor (expected >= {next}).");
+            Assert.Equal(0, info.Offset % 32);   // every tensor start is 32-byte aligned (GGUF spec)
+            next = info.Offset + info.ByteLength;
         }
 
-        const uint alignment = 32;
-        long dataStart = Align(fs.Position, alignment);
-        long expected = dataStart;
-
-        for (ulong i = 0; i < tensorCount; i++)
-        {
-            string name = ReadString(r);
-            uint nDims = r.ReadUInt32();
-            Assert.InRange(nDims, 1u, 4u);
-            long elements = 1;
-            for (uint d = 0; d < nDims; d++) elements *= (long)r.ReadUInt64();
-            Assert.Equal(GgmlType.F32, r.ReadUInt32());
-            long offset = (long)r.ReadUInt64();
-
-            Assert.True(offset >= expected, $"Tensor '{name}' offset {offset} overlaps previous tensor (expected >= {expected}).");
-            Assert.Equal(0, offset % alignment);           // every tensor start is 32-byte aligned (GGUF spec)
-            expected = offset + elements * 4;              // next free byte (before alignment)
-        }
-
-        // File must be at least as long as the last tensor's end.
-        Assert.True(fs.Length >= expected);
+        // Offsets are RELATIVE to the data section — the last tensor's end
+        // must land inside the file (absolute offsets would run past it).
+        Assert.True(gguf.DataStart + next <= new FileInfo(path).Length);
     }
 
     [Fact]
@@ -248,12 +227,13 @@ public class ExportTests : IDisposable
         string path = Path.Combine(_dir, "yume.gguf");
         MindExporter.ExportGguf(mind, path);
 
-        var (names, shapes, blobs) = ParseGgufTensors(path);
+        var gguf = new GgufReader(path);
+        var info = gguf.Tensors.Single(t => t.Name == "cognify.net.w1");
 
-        int w1 = names.IndexOf("cognify.net.w1");
-        Assert.True(w1 >= 0, "w1 tensor missing.");
-        Assert.Equal(new long[] { net.HiddenDim, net.InputDim }, shapes[w1]);
-        Assert.Equal(net.GetW1().SelectMany(r => r).Select(v => (float)v), blobs[w1]);
+        // Logical shape, outer first — [Hidden, In] exactly like the live net.
+        Assert.Equal(new long[] { net.HiddenDim, net.InputDim }, info.Shape);
+        var data = gguf.ReadTensor("cognify.net.w1");
+        Assert.Equal(net.GetW1().SelectMany(r => r).Select(v => (float)v), data);
     }
 
     [Fact]
@@ -279,12 +259,108 @@ public class ExportTests : IDisposable
 
         // Minimal mind still carries learning (thinking + learning + memory),
         // so its 4 MicroNet tensors (w1, b1, w2, b2) must be present.
-        using var fs = File.OpenRead(path);
-        using var r = new BinaryReader(fs);
-        Assert.Equal(0x46554747u, r.ReadUInt32());
-        Assert.Equal(3u, r.ReadUInt32());
-        Assert.Equal(4ul, r.ReadUInt64());
-        Assert.True(r.ReadUInt64() > 0);
+        var gguf = new GgufReader(path);
+        Assert.Equal(4, gguf.Tensors.Count);
+    }
+
+    [Fact]
+    public void LlamaCppGguf_requires_trained_transformer()
+    {
+        using var mind = MinimalMind();
+        string path = Path.Combine(_dir, "x.gguf");
+        var ex = Assert.Throws<InvalidOperationException>(
+            () => MindExporter.ExportGgufForLlamaCpp(mind, path));
+        Assert.Contains("not trained", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void LlamaCppGguf_uses_gpt2_architecture_and_exact_llama_cpp_tensor_set()
+    {
+        using var mind = TrainedMind();
+        mind.TrainDeepModel(1);
+        Assert.True(mind.NeuralLanguageModel.IsTrained);
+
+        string path = Path.Combine(_dir, "yume-llamacpp.gguf");
+        var result = MindExporter.ExportGgufForLlamaCpp(mind, path);
+
+        var cfg = mind.NeuralLanguageModel.Config;
+        Assert.Equal(2 + cfg.Layers * 12 + 2, result.TensorCount);
+
+        var gguf = new GgufReader(path);
+        Assert.Equal("gpt2", gguf.Metadata["general.architecture"].AsString());
+        Assert.Equal((uint)cfg.ContextLen, gguf.Metadata["gpt2.context_length"].AsUInt32());
+        Assert.Equal((uint)cfg.Dim, gguf.Metadata["gpt2.embedding_length"].AsUInt32());
+        Assert.Equal((uint)cfg.Layers, gguf.Metadata["gpt2.block_count"].AsUInt32());
+        Assert.Equal((uint)cfg.Heads, gguf.Metadata["gpt2.attention.head_count"].AsUInt32());
+        Assert.Equal(1e-5f, gguf.Metadata["gpt2.attention.layer_norm_epsilon"].AsFloat32());
+        Assert.Equal("gpt2", gguf.Metadata["tokenizer.ggml.model"].AsString());
+
+        // Exactly the tensor set llama.cpp's gpt2 graph loads (output head tied → absent).
+        var expected = new List<string> { "token_embd.weight", "position_embd.weight" };
+        for (int l = 0; l < cfg.Layers; l++)
+            expected.AddRange(new[]
+            {
+                $"blk.{l}.attn_norm.weight", $"blk.{l}.attn_norm.bias",
+                $"blk.{l}.attn_qkv.weight", $"blk.{l}.attn_qkv.bias",
+                $"blk.{l}.attn_output.weight", $"blk.{l}.attn_output.bias",
+                $"blk.{l}.ffn_norm.weight", $"blk.{l}.ffn_norm.bias",
+                $"blk.{l}.ffn_up.weight", $"blk.{l}.ffn_up.bias",
+                $"blk.{l}.ffn_down.weight", $"blk.{l}.ffn_down.bias",
+            });
+        expected.AddRange(new[] { "output_norm.weight", "output_norm.bias" });
+        Assert.Equal(expected, gguf.Tensors.Select(t => t.Name).ToList());
+
+        // Logical shapes, outer first — [V, D] embeddings, [3D, D] fused QKV.
+        int vocab = mind.NeuralLanguageModel.VocabularySize;
+        Assert.Equal(new long[] { vocab, cfg.Dim },
+            gguf.Tensors.Single(t => t.Name == "token_embd.weight").Shape);
+        Assert.Equal(new long[] { cfg.ContextLen, cfg.Dim },
+            gguf.Tensors.Single(t => t.Name == "position_embd.weight").Shape);
+        Assert.Equal(new long[] { cfg.Dim * 3, cfg.Dim },
+            gguf.Tensors.Single(t => t.Name == "blk.0.attn_qkv.weight").Shape);
+        Assert.Equal(new long[] { cfg.Dim * 3 },
+            gguf.Tensors.Single(t => t.Name == "blk.0.attn_qkv.bias").Shape);
+        Assert.DoesNotContain(gguf.Tensors, t => t.Name == "output.weight");
+
+        // Tokenizer: token count == embedding rows, specials verbatim, words
+        // byte-unicode with a leading Ġ, merges rebuild the first word.
+        var tokens = gguf.Metadata["tokenizer.ggml.tokens"].AsStringArray();
+        Assert.Equal(vocab, tokens.Count);
+        Assert.Equal(new[] { "<pad>", "<unk>", "<bos>", "<eos>" }, tokens.Take(4).ToArray());
+        Assert.StartsWith("Ġ", tokens[4], StringComparison.Ordinal);
+        Assert.Equal(2u, gguf.Metadata["tokenizer.ggml.bos_token_id"].AsUInt32());
+        Assert.Equal(3u, gguf.Metadata["tokenizer.ggml.eos_token_id"].AsUInt32());
+        var merges = gguf.Metadata["tokenizer.ggml.merges"].AsStringArray();
+        Assert.NotEmpty(merges);   // llama.cpp refuses gpt2 vocabs without merges
+        var chars = new List<string>(tokens[4].Select(c => c.ToString()));
+        while (chars.Count > 1)
+        {
+            Assert.Contains(chars[0] + " " + chars[1], merges);
+            chars[0] += chars[1];
+            chars.RemoveAt(1);
+        }
+        Assert.Equal(tokens[4], string.Concat(chars));
+
+        // Fused QKV must equal [Wq; Wk; Wv] exactly (llama.cpp's c_attn layout).
+        var fused = gguf.ReadTensor("blk.0.attn_qkv.weight");
+        var parts = new[] { "wq", "wk", "wv" }
+            .Select(suffix => mind.NeuralLanguageModel.ExportTensors()
+                .Single(t => t.Name == $"cognify.transformer.l0.attn.{suffix}").Matrix)
+            .SelectMany(m => m.SelectMany(r => r)).Select(v => (float)v).ToList();
+        Assert.Equal(parts, fused);
+    }
+
+    [Fact]
+    public void LlamaCppGguf_export_bundle_includes_runnable_file()
+    {
+        using var mind = TrainedMind();
+        mind.TrainDeepModel(1);
+        string dir = Path.Combine(_dir, "bundle");
+        var files = MindExporter.ExportBundle(mind, dir);
+
+        Assert.Contains(files, f => f.EndsWith("-llamacpp.gguf", StringComparison.Ordinal));
+        var gguf = new GgufReader(Path.Combine(dir, files.Single(f => f.EndsWith("-llamacpp.gguf", StringComparison.Ordinal))));
+        Assert.Equal("gpt2", gguf.Metadata["general.architecture"].AsString());
     }
 
     // ------------------------------------------------------------------
@@ -571,9 +647,12 @@ public class ExportTests : IDisposable
             Assert.True(File.Exists(Path.Combine(outDir, expected)), $"Missing bundle file: {expected}");
 
         // finetune.sh references the standard llama.cpp trainer and our artifacts.
+        // The target model is the RUNNABLE gpt2 export — llama.cpp cannot load
+        // the 'cognify' archive GGUF.
         string finetune = File.ReadAllText(Path.Combine(outDir, "finetune.sh"));
         Assert.Contains("llama-finetune", finetune);
-        Assert.Contains("yume.gguf", finetune);
+        Assert.Contains("yume-llamacpp.gguf", finetune);
+        Assert.DoesNotContain("MODEL=\"yume.gguf\"", finetune);
         Assert.Contains("--lora-out", finetune);
 
         // quantize.sh targets the standard quant types.
@@ -584,7 +663,7 @@ public class ExportTests : IDisposable
 
         // train_config.json is valid JSON with the usual keys.
         using var cfg = JsonDocument.Parse(File.ReadAllText(Path.Combine(outDir, "train_config.json")));
-        Assert.Equal("yume.gguf", cfg.RootElement.GetProperty("model").GetString());
+        Assert.Equal("yume-llamacpp.gguf", cfg.RootElement.GetProperty("model").GetString());
         Assert.Equal("training_data.txt", cfg.RootElement.GetProperty("train_data").GetString());
         Assert.Equal(2, cfg.RootElement.GetProperty("epochs").GetInt32());
         Assert.True(cfg.RootElement.TryGetProperty("quantization", out _));
@@ -614,6 +693,160 @@ public class ExportTests : IDisposable
         Assert.Equal("my-ai-v2", MindExporter.Sanitize("My AI  V2"));
         Assert.Equal("cognify-model", MindExporter.Sanitize("   "));
     }
+
+    // ------------------------------------------------------------------
+    // llama.cpp robustness: script correctness, safetensors convention,
+    // and GgufDiagnostics (the anti-"Failed to load model" tooling)
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public void Finetune_script_uses_single_backslash_continuations()
+    {
+        // Regression: the writer emitted verbatim "\\" into finetune.sh, which
+        // bash reads as an escaped backslash — NOT a line continuation — so
+        // the whole llama-finetune call broke on first run.
+        using var mind = TrainedMind();
+        string outDir = Path.Combine(_dir, "bundle-script");
+        MindExporter.ExportBundle(mind, outDir, new ExportOptions { ModelName = "Yume" });
+
+        string finetune = File.ReadAllText(Path.Combine(outDir, "finetune.sh"));
+        Assert.DoesNotContain("\\\\\r\n", finetune);
+        Assert.DoesNotContain("\\\\\n", finetune);
+        Assert.Contains("\\\n", finetune);                       // single-backslash continuations exist
+        Assert.Contains("--lora-out", finetune);
+        Assert.Contains("llama-cli --model $MODEL --lora $LORA_OUT", finetune); // apply hint
+    }
+
+    [Fact]
+    public void Safetensors_use_pt_format_metadata()
+    {
+        using var mind = TrainedMind();
+        string path = Path.Combine(_dir, "yume.safetensors");
+        MindExporter.ExportSafetensors(mind, path);
+
+        byte[] bytes = File.ReadAllBytes(path);
+        ulong headerLength = BitConverter.ToUInt64(bytes, 0);
+        using var doc = JsonDocument.Parse(System.Text.Encoding.UTF8.GetString(
+            bytes, 8, (int)headerLength));
+        var metadata = doc.RootElement.GetProperty("__metadata__");
+        Assert.Equal("pt", metadata.GetProperty("format").GetString());
+    }
+
+    [Fact]
+    public void Diagnostics_vouches_for_the_runnable_gpt2_export()
+    {
+        using var mind = TrainedMind();
+        mind.TrainDeepModel(1);
+        string path = Path.Combine(_dir, "diag-ok.gguf");
+        MindExporter.ExportGgufForLlamaCpp(mind, path);   // its own self-check must pass
+
+        var report = GgufDiagnostics.Inspect(path);
+        Assert.True(report.SpecValid);
+        Assert.True(report.LoadableByStockLlamaCpp);
+        Assert.Equal("gpt2", report.Architecture);
+        Assert.Empty(report.Issues);
+        Assert.Empty(report.Advice);
+        Assert.All(report.TensorTypes, t => Assert.Equal("F32", t.TypeName));
+    }
+
+    [Fact]
+    public void Diagnostics_explains_the_cognify_archive()
+    {
+        using var mind = TrainedMind();
+        string path = Path.Combine(_dir, "diag-archive.gguf");
+        MindExporter.ExportGguf(mind, path);
+
+        var report = GgufDiagnostics.Inspect(path);
+        Assert.True(report.SpecValid);
+        Assert.Equal("cognify", report.Architecture);
+        Assert.False(report.LoadableByStockLlamaCpp);     // not runnable — by design
+        Assert.Contains("archive", report.Verdict, StringComparison.Ordinal);
+        Assert.Contains(report.Advice, a => a.Contains("llamacpp.gguf", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Diagnostics_flags_foreign_quant_types_with_honest_advice()
+    {
+        // Hand-build a minimal, structurally valid GGUF whose tensors use
+        // MXFP4 (type 39) — the quant class that ships with publisher forks
+        // and breaks older llama.cpp builds. The report must say exactly that.
+        string path = Path.Combine(_dir, "diag-mxfp4.gguf");
+        WriteForeignQuantGguf(path, typeId: 39);
+
+        var report = GgufDiagnostics.Inspect(path);
+        Assert.True(report.SpecValid);
+        Assert.False(report.LoadableByStockLlamaCpp);
+        Assert.Contains(report.TensorTypes, t => t.TypeId == 39 && t.TypeName == "MXFP4");
+        Assert.Contains(report.Issues, i => i.Contains("MXFP4", StringComparison.Ordinal));
+        Assert.Contains(report.Advice, a =>
+            a.Contains("newer llama.cpp", StringComparison.OrdinalIgnoreCase) &&
+            a.Contains("Pick another quant", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Diagnostics_names_unknown_quant_ids_as_unknown()
+    {
+        string path = Path.Combine(_dir, "diag-future.gguf");
+        WriteForeignQuantGguf(path, typeId: 200);
+
+        var report = GgufDiagnostics.Inspect(path);
+        Assert.Contains(report.TensorTypes, t =>
+            t.TypeId == 200 && t.TypeName.Contains("unknown", StringComparison.Ordinal));
+        Assert.False(report.LoadableByStockLlamaCpp);
+    }
+
+    [Fact]
+    public void Diagnostics_rejects_structurally_broken_files()
+    {
+        string path = Path.Combine(_dir, "diag-truncated.gguf");
+        using (var mind = TrainedMind())
+        {
+            mind.TrainDeepModel(1);
+            MindExporter.ExportGgufForLlamaCpp(mind, path);
+        }
+        using (var stream = new FileStream(path, FileMode.Open))
+        {
+            stream.SetLength(stream.Length / 2);   // chop the payload off
+        }
+
+        var report = GgufDiagnostics.Inspect(path);
+        Assert.False(report.SpecValid);
+        Assert.False(report.LoadableByStockLlamaCpp);
+        Assert.Contains(report.Issues, i => i.Contains("past the end", StringComparison.Ordinal));
+    }
+
+    /// <summary>Writes a minimal valid GGUF v3 with ONE metadata pair
+    /// (arch=gpt2) and ONE tensor whose ggml type id is <paramref name="typeId"/>
+    /// (payload bytes are filler — diagnostics never decodes payloads).</summary>
+    private void WriteForeignQuantGguf(string path, uint typeId)
+    {
+        using var stream = new FileStream(path, FileMode.Create);
+        using var w = new BinaryWriter(stream);
+        w.Write(0x46554747u);                 // magic
+        w.Write(3u);                          // version
+        w.Write(1UL);                         // tensor count
+        w.Write(1UL);                         // kv count
+        w.Write((ulong) System.Text.Encoding.UTF8.GetByteCount("general.architecture"));
+        w.Write(System.Text.Encoding.UTF8.GetBytes("general.architecture"));
+        w.Write((uint)GgufValueType.String);
+        w.Write((ulong) System.Text.Encoding.UTF8.GetByteCount("gpt2"));
+        w.Write(System.Text.Encoding.UTF8.GetBytes("gpt2"));
+        // tensor info: name, n_dims=1, ne=[32], type, offset=0
+        w.Write((ulong) System.Text.Encoding.UTF8.GetByteCount("blk.0.attn_qkv.weight"));
+        w.Write(System.Text.Encoding.UTF8.GetBytes("blk.0.attn_qkv.weight"));
+        w.Write(1u);
+        w.Write(32UL);
+        w.Write(typeId);
+        w.Write(0UL);
+        // pad to the 32-byte data alignment, then filler payload bytes (enough
+        // for the diagnostics' 1.25 B/elem quant upper bound + headroom)
+        long pos = w.BaseStream.Position;
+        long dataStart = (pos + 31) / 32 * 32;
+        for (long i = pos; i < dataStart; i++) w.Write((byte)0);
+        for (int i = 0; i < 104; i++) w.Write((byte)0xAB);
+        w.Flush();
+    }
+
 
     // ------------------------------------------------------------------
     // GGUF binary-walk helpers (shared by several tests)
@@ -686,54 +919,6 @@ public class ExportTests : IDisposable
             offset = Align(offset, alignment);
         }
         return kvs;
-    }
-
-    private static (List<string> Names, List<long[]> Shapes, List<float[]> Blobs) ParseGgufTensors(string path)
-    {
-        using var fs = File.OpenRead(path);
-        using var r = new BinaryReader(fs);
-        Assert.Equal(0x46554747u, r.ReadUInt32());
-        Assert.Equal(3u, r.ReadUInt32());
-        ulong tensorCount = r.ReadUInt64();
-        ulong kvCount = r.ReadUInt64();
-
-        for (ulong i = 0; i < kvCount; i++)
-        {
-            ReadString(r);
-            var type = (GgufValueType)r.ReadUInt32();
-            ReadGgufValue(r, type);
-        }
-
-        // Read tensor infos, keeping each tensor's STORED offset.
-        var infos = new List<(string Name, long[] Shape, long Offset)>();
-        for (ulong i = 0; i < tensorCount; i++)
-        {
-            string name = ReadString(r);
-            uint nDims = r.ReadUInt32();
-            var shape = new long[nDims];
-            for (uint d = 0; d < nDims; d++) shape[d] = (long)r.ReadUInt64();
-            Assert.Equal(GgmlType.F32, r.ReadUInt32());
-            long offset = (long)r.ReadUInt64();
-            infos.Add((name, shape, offset));
-        }
-
-        // Read each tensor's payload AT ITS STORED OFFSET — this verifies the
-        // offsets actually point at the data (would catch layout bugs).
-        var names = new List<string>();
-        var shapes = new List<long[]>();
-        var blobs = new List<float[]>();
-        foreach (var (name, shape, offset) in infos)
-        {
-            long elements = shape.Aggregate(1L, (a, b) => a * b);
-            r.BaseStream.Seek(offset, SeekOrigin.Begin);
-            var data = new float[elements];
-            for (long e = 0; e < elements; e++) data[e] = r.ReadSingle();
-            names.Add(name);
-            shapes.Add(shape);
-            blobs.Add(data);
-        }
-
-        return (names, shapes, blobs);
     }
 
     /// <summary>

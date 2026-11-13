@@ -144,6 +144,44 @@ public sealed class ThinkingOptions
     /// </summary>
     public int ThoughtBudget { get; set; } = 0;
 
+    /// <summary>
+    /// THINKING AUTOMATIC — the mind chooses how much to think about each
+    /// topic or conversation itself. When true, <see cref="Level"/> becomes
+    /// the BASE level and every cycle picks its own effort from the actual
+    /// input: a familiar simple line is answered with a quick Low think,
+    /// while a long "why/how" question or a fresh inference earns High…Max.
+    /// The choice is always clamped by <see cref="Ceiling"/> and recorded in
+    /// the chain of thought ("Automatic: chose to think at High"), so it
+    /// stays explainable. Default false — the developer's level is used as-is.
+    /// </summary>
+    public bool Automatic { get; set; } = false;
+
+    /// <summary>Fluent setter: <see cref="Automatic"/> — the mind picks its own thinking effort per cycle.</summary>
+    public ThinkingOptions AutomaticOn(bool value = true) { Automatic = value; return this; }
+
+    /// <summary>
+    /// Returns a copy of these options with the thinking level set to
+    /// <paramref name="level"/> (ceiling still applies). Used by the
+    /// automatic mode so the per-cycle choice never mutates the shared
+    /// configuration object.
+    /// </summary>
+    public ThinkingOptions ForLevel(ThinkingLevel level)
+    {
+        var copy = new ThinkingOptions
+        {
+            MaxThoughtSteps = MaxThoughtSteps,
+            DeliberationCandidates = DeliberationCandidates,
+            ConfidenceFloor = ConfidenceFloor,
+            Enabled = Enabled,
+            Level = Level,
+            Ceiling = Ceiling,
+            Tone = Tone,
+            ThoughtBudget = ThoughtBudget,
+            Automatic = Automatic,
+        };
+        return copy.At(level);
+    }
+
     /// <summary>Fluent setter: <see cref="MaxThoughtSteps"/>.</summary>
     public ThinkingOptions Steps(int value) { MaxThoughtSteps = value; return this; }
 
@@ -187,6 +225,9 @@ public sealed class ThinkingOptions
     /// <summary>Fluent setter: <see cref="ThoughtBudget"/>.</summary>
     public ThinkingOptions Budget(int tokens) { ThoughtBudget = Math.Max(0, tokens); return this; }
 
+    /// <summary>Fluent setter: <see cref="Automatic"/>.</summary>
+    public ThinkingOptions Auto(bool value = true) { Automatic = value; return this; }
+
     /// <summary>
     /// Generated-thought count for the current level/budget — the size of
     /// the mind's "thinking token set" (1..10) per cycle.
@@ -206,6 +247,40 @@ public sealed class ThinkingOptions
             };
         }
     }
+}
+
+/// <summary>
+/// Conversational settings — how TALKATIVE the mind is and how much it
+/// collects from the conversation. Configured with
+/// <c>WithConversational(c => c.rate(amount))</c>.
+/// </summary>
+public sealed class ConversationalOptions
+{
+    /// <summary>
+    /// How much the mind speaks per reply, as a multiplier of its natural
+    /// length. 1.0 (default) is the classic Cognify pacing; 1.5+ makes her
+    /// chattier — replies grow an extra conversational sentence drawn from
+    /// related knowledge, memories and the conversation itself — and 2.0+
+    /// may add a second one, so she carries the topic further like a person
+    /// who enjoys talking. Values below 1.0 keep replies shorter (0.5
+    /// biases toward the concise style). Clamped to [0.5, 3.0].
+    /// </summary>
+    public double Rate { get; set; } = 1.0;
+
+    /// <summary>
+    /// Conversation understanding: when true the mind tracks how the talk
+    /// moves from topic to topic and keeps a compact understanding note in
+    /// memory (source "conversation") whenever the subject shifts — so
+    /// recall later knows not just isolated lines but the shape of the
+    /// conversation. Default true.
+    /// </summary>
+    public bool Understand { get; set; } = true;
+
+    /// <summary>Fluent setter: <see cref="Rate"/> — how talkative she is (0.5..3.0).</summary>
+    public ConversationalOptions rate(double amount) { Rate = Math.Clamp(amount, 0.5, 3.0); return this; }
+
+    /// <summary>Fluent setter: <see cref="Understand"/>.</summary>
+    public ConversationalOptions understand(bool value = true) { Understand = value; return this; }
 }
 
 /// <summary>
@@ -524,23 +599,37 @@ public sealed class ToolOptions
     /// <summary>
     /// Optional custom web-search backend. Assign an
     /// <c>Cognify.Tools.IWebSearchBackend</c> to replace the default
-    /// DuckDuckGo HTTP backend (e.g. Bing, SerpAPI, a local index).
+    /// multi-engine chain (Google News → Wikipedia → Bing; DuckDuckGo was
+    /// removed by design), e.g. SerpAPI or a local index.
     /// </summary>
     public object? WebSearchBackend { get; set; }
 
     /// <summary>
-    /// Optional custom page fetcher for web exploration. Assign an
-    /// <c>Cognify.Tools.IWebPageFetcher</c> to replace the default HTTP
-    /// fetcher (e.g. fixtures in tests, a caching proxy, an intranet mirror).
+    /// AUTONOMOUS WEB LOOKUP. When true, the mind may use its own WebFetch
+    /// during conversation: when a topic is clearly OUTSIDE her knowledge
+    /// (no facts, no memory), she says so naturally — "I don't know much
+    /// about X, but I'll search it and understand it a bit more" — looks it
+    /// up herself, learns from the results, and answers from what she
+    /// found. Still guarded: one lookup per unfamiliar topic, arithmetic /
+    /// identity / greetings never trigger it, and a failed lookup stays
+    /// silent (she just answers honestly as before). Off by default — a
+    /// builder decision via <c>WithAutoWebFetch()</c>.
     /// </summary>
-    public object? WebPageFetcher { get; set; }
+    public bool AutoFetchWeb { get; set; } = false;
 
     /// <summary>
-    /// How far the mind reads INTO the web: after a search she opens the most
-    /// relevant result and learns from the page itself (not just the snippet),
-    /// and <c>/explore &lt;url&gt;</c> visits any page directly.
+    /// How many pages one site exploration (<c>/explore</c>,
+    /// <see cref="Core.Mind.ExploreUrl"/>) reads: the starting page plus
+    /// internal links (same host) so she is not locked to a single page.
+    /// Default 3, range 1..6.
     /// </summary>
-    public WebExplorationOptions WebExploration { get; set; } = new();
+    public int ExploreMaxPages { get; set; } = 3;
+
+    /// <summary>Fluent setter: <see cref="AutoFetchWeb"/>.</summary>
+    public ToolOptions AutoFetch(bool value) { AutoFetchWeb = value; return this; }
+
+    /// <summary>Fluent setter: <see cref="ExploreMaxPages"/> (clamped 1..6).</summary>
+    public ToolOptions ExplorePages(int pages) { ExploreMaxPages = Math.Clamp(pages, 1, 6); return this; }
 
     /// <summary>Phrases that signal a tool request (matched case-insensitively).</summary>
     public List<string> InvokeTriggers { get; set; } = new()
@@ -555,57 +644,6 @@ public sealed class ToolOptions
 
     /// <summary>Fluent setter: <see cref="AllowWebSearch"/>.</summary>
     public ToolOptions WebSearch(bool value) { AllowWebSearch = value; return this; }
-
-    /// <summary>Fluent setter for <see cref="WebExploration"/> (e.g. <c>t.Exploration(e =&gt; e.Follow(false))</c>).</summary>
-    public ToolOptions Exploration(Action<WebExplorationOptions> configure)
-    {
-        configure(WebExploration);
-        return this;
-    }
-}
-
-/// <summary>
-/// How far the mind reads INTO the web. A search result is only a doorway:
-/// when exploration is on, the mind opens the most relevant result and learns
-/// from the page's actual text (thousands of characters, not a 140-character
-/// snippet), and — when allowed — steps through an in-page link to even more
-/// relevant ground. That is what stops her from being "locked to bing.com":
-/// the SERP only decides where she starts reading.
-/// </summary>
-public sealed class WebExplorationOptions
-{
-    /// <summary>
-    /// After a successful search, open the most relevant result page and learn
-    /// from its readable text. On by default — search is already an explicit
-    /// user action, so reading one page further stays within the same consent.
-    /// </summary>
-    public bool ExploreResults { get; set; } = true;
-
-    /// <summary>
-    /// When the opened page is a poor match for the query, the explorer may
-    /// follow the in-page link whose anchor text / url matches the query best
-    /// (one step per page, up to <see cref="MaxPages"/>). This is how a hit on
-    /// a site's front door turns into the actual article about the topic.
-    /// </summary>
-    public bool FollowLinks { get; set; } = true;
-
-    /// <summary>Maximum number of pages read per exploration (1..4, default 2).</summary>
-    public int MaxPages { get; set; } = 2;
-
-    /// <summary>Readable-text budget per page, in characters (default 4000).</summary>
-    public int MaxPageChars { get; set; } = 4000;
-
-    /// <summary>Fluent setter: <see cref="ExploreResults"/>.</summary>
-    public WebExplorationOptions Explore(bool value) { ExploreResults = value; return this; }
-
-    /// <summary>Fluent setter: <see cref="FollowLinks"/>.</summary>
-    public WebExplorationOptions Follow(bool value) { FollowLinks = value; return this; }
-
-    /// <summary>Fluent setter: <see cref="MaxPages"/> (clamped to 1..4).</summary>
-    public WebExplorationOptions Pages(int value) { MaxPages = Math.Clamp(value, 1, 4); return this; }
-
-    /// <summary>Fluent setter: <see cref="MaxPageChars"/> (clamped to 400..20000).</summary>
-    public WebExplorationOptions Budget(int value) { MaxPageChars = Math.Clamp(value, 400, 20000); return this; }
 }
 
 /// <summary>Options for the code module.</summary>
@@ -690,6 +728,9 @@ public sealed class MindConfig
 
     /// <summary>Expression options — what the mind shows in chat.</summary>
     public ExpressionOptions Expression { get; set; } = new();
+
+    /// <summary>Conversational options — talkativeness and conversation understanding.</summary>
+    public ConversationalOptions Conversational { get; set; } = new();
 
     /// <summary>Self-learning options.</summary>
     public LearningOptions Learning { get; set; } = new();

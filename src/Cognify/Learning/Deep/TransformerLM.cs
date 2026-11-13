@@ -221,6 +221,13 @@ public sealed class TransformerLM
     /// <summary>The model's architecture configuration.</summary>
     public TransformerConfig Config { get { lock (_gate) return _cfg; } }
 
+    /// <summary>Vocabulary strings in id order (specials first: &lt;pad&gt;, &lt;unk&gt;,
+    /// &lt;bos&gt;, &lt;eos&gt;) — used by the export pipeline to write tokenizer metadata.</summary>
+    public IReadOnlyList<string> ExportVocab()
+    {
+        lock (_gate) return _vocab.ToArray();
+    }
+
     /// <summary>True once the model has completed at least one training pass.</summary>
     public bool IsTrained { get { lock (_gate) return _epochsTrained > 0; } }
 

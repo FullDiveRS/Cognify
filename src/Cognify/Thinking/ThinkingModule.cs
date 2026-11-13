@@ -223,12 +223,32 @@ public sealed class ThinkingModule : CognitiveModuleBase
             return;
         }
 
-        // 5c. GENERATE — the thought generator produces the mind's silent
+        // 5c. THINKING AUTOMATIC — when the developer turned it on, the mind
+        // picks its own effort for THIS cycle from the actual input: a short
+        // familiar line earns a quick Low think, a long "why/how" question or
+        // a fresh inference earns High…Max. The choice is clamped by the
+        // ceiling and recorded in the chain of thought, so it stays
+        // explainable. An explicit ThoughtBudget overrides the choice (the
+        // developer named the exact token budget — that wins).
+        var effectiveOptions = _options;
+        if (_options.Automatic && _options.ThoughtBudget <= 0)
+        {
+            // The choice is clamped by the ceiling BEFORE it is announced, so
+            // the chain note always names the level actually used.
+            var chosenLevel = _options.Ceiling.Clamp(ChooseAutomaticLevel(context, answer));
+            effectiveOptions = _options.ForLevel(chosenLevel);
+            chain.Add(ThoughtPhase.Observe,
+                $"Automatic: chose to think at {chosenLevel} for this input " +
+                $"({DescribeEffort(context, answer)}).", 0.6);
+            Stream.Add("Observe", chain.Steps[^1].Text);
+        }
+
+        // 5d. GENERATE — the thought generator produces the mind's silent
         // self-talk BEFORE any reply is composed (thinking levels Low..Max
         // size it; the tone flavors it). This is the "generate its thoughts
         // before speaking" phase: the reply is the RESULT the mind arrives
         // at after these thoughts, not the first thing it does.
-        var generated = ThoughtGenerator.Generate(context, _options, rng);
+        var generated = ThoughtGenerator.Generate(context, effectiveOptions, rng);
         var generatedTexts = new List<string>();
         foreach (var (thought, conf) in generated)
         {
@@ -412,6 +432,54 @@ public sealed class ThinkingModule : CognitiveModuleBase
         var template = ResponseComposer.TemplateKey(pick);
         bool exists = context.Mind.Phrases.All().Any(s => ResponseComposer.TemplateKey(s) == template);
         if (!exists) context.Mind.Phrases.Add(pick);
+    }
+
+    /// <summary>
+    /// THINKING AUTOMATIC — the per-cycle effort choice. A small effort score
+    /// is read straight off this cycle's facts (no magic): input length,
+    /// open "why/how/explain" questions, a missing direct answer, fresh
+    /// inferences and strong emotions all raise it. The score maps onto the
+    /// five levels; <see cref="ThinkingOptions.ForLevel"/> applies the
+    /// ceiling clamp, so a capped model never thinks past its cap.
+    /// </summary>
+    internal static ThinkingLevel ChooseAutomaticLevel(CognitiveContext context, string? directAnswer)
+    {
+        var text = context.EffectiveContent ?? "";
+        double effort = 0;
+
+        if (text.Length >= 140) effort += 1.0;
+        else if (text.Length >= 45) effort += 0.5;
+        else if (text.Length >= 15) effort += 0.3;
+
+        var lowered = text.ToLowerInvariant();
+        if (lowered.Contains("why") || lowered.Contains("how ") || lowered.Contains("explain")
+            || lowered.Contains("imagine") || lowered.Contains("design") || lowered.Contains("compare"))
+            effort += 1.0;
+
+        if (directAnswer is null) effort += 0.4;          // knowledge gap: think harder
+        if ((context.Reasoning?.Inferred.Count ?? 0) > 0) effort += 0.5;
+        if (context.Recalled.Count == 0) effort += 0.2;   // nothing to lean on
+        if ((context.Emotions?.DominantIntensity ?? 0) > 0.5) effort += 0.25;
+
+        return effort switch
+        {
+            < 0.7 => ThinkingLevel.Low,
+            < 1.4 => ThinkingLevel.Medium,
+            < 2.1 => ThinkingLevel.High,
+            < 2.8 => ThinkingLevel.VeryHigh,
+            _ => ThinkingLevel.Max,
+        };
+    }
+
+    /// <summary>Short human reason for the automatic effort choice (chain notes).</summary>
+    private static string DescribeEffort(CognitiveContext context, string? directAnswer)
+    {
+        var reasons = new List<string>();
+        if ((context.EffectiveContent?.Length ?? 0) >= 45) reasons.Add("a longer input");
+        if ((context.Reasoning?.Inferred.Count ?? 0) > 0) reasons.Add("fresh inferences to check");
+        if (directAnswer is null) reasons.Add("no direct answer at hand");
+        if (context.Recalled.Count > 0) reasons.Add("memories to weigh");
+        return reasons.Count > 0 ? string.Join(", ", reasons) : "a short, familiar line";
     }
 
     /// <summary>

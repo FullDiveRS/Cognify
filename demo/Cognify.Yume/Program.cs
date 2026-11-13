@@ -26,12 +26,19 @@ using Cognify.Tools;
 //    /train <file>          bulk-train a corpus file (images work too —
 //                           she reads the words out of a text image!)
 //    /look <image>          read an image without training on it
-//    /searchweb <query>     explicit web search — she looks it up, then READS
-//                           INTO the most relevant result (the page itself,
-//                           not the snippet) and learns from it. Web search
-//                           is manual-only: she NEVER goes online unprompted.
-//    /explore <url>         open a specific page (any site!) and read it —
-//                           she is not locked to a search engine's results.
+//    /searchweb "<query>" [suggestion]
+//                           explicit web search — she looks it up, learns
+//                           from the results, and reports back. The quoted
+//                           part is the query; the rest is HER focus (which
+//                           results matter). Web search is manual-only: she
+//                           NEVER goes online unprompted.
+//    /explore <url> [suggestion]
+//                           her own WebFetch + site walk — reads the page AND
+//                           follows internal links (focus-steered), learns
+//                           everything it reads (memories, facts, language).
+//    /autofetch on|off      her AUTONOMOUS WebFetch: when a topic is clearly
+//                           outside her knowledge she says so naturally and
+//                           searches it herself (default on in this demo).
 //    /improve               run a self-improvement review pass
 //    /predict <text>        her next-token prediction after your words
 //                           (hybrid: n-gram statistics + her transformer)
@@ -68,14 +75,15 @@ if (File.Exists(DbPath))
     yume = MindBuilder.Restore(DbPath);
     firstActivation = false;
     // Restored minds predate per-version capability wiring: make sure the
-    // manual-only web tools exist so /searchweb and /explore always work.
+    // manual-only web-search AND web-fetch tools exist so /searchweb and
+    // /explore always work.
     yume.Config.Tools.AllowWebSearch = true;
     if (yume.Tools is { } tools)
     {
         if (tools.Registry.Get("web-search") is null)
             tools.Registry.Register(new WebSearchTool());
-        if (tools.Registry.Get("web-explore") is null)
-            tools.Registry.Register(new WebExploreTool(null, yume.Config.Tools.WebExploration));
+        if (tools.Registry.Get("web-fetch") is null)
+            tools.Registry.Register(new WebFetchTool());
     }
     Console.WriteLine($"[Yume re-awakened. Cycle #{yume.CycleCount} — she remembers you.]");
     Console.WriteLine($"[{yume.Knowledge?.FactCount ?? 0} facts, " +
@@ -94,18 +102,29 @@ else
         .WithEmotions(e => e.Intensity(0.85))          // how strongly she feels
         .WithReasoning()                                // facts + inference
         .WithThinking(t => t.At(ThinkingLevel.High)     // thinking levels: Low..Max —
-                                     .WithTone("balanced")) // how many thoughts before speaking,
-                                                        // and in what tone (focused/playful/
-                                                        // poetic/plain/balanced). Turn the whole
-                                                        // machinery off with WithThinking(enabled: false).
+                                     .WithTone("balanced") // how many thoughts before speaking,
+                                     .AutomaticOn())    // and in what tone (focused/playful/
+                                                        // poetic/plain/balanced). AUTOMATIC lets
+                                                        // her choose the effort per topic: a short
+                                                        // familiar line thinks Low, a long "why"
+                                                        // question thinks High..Max (ceiling still
+                                                        // applies). Turn the whole machinery off
+                                                        // with WithThinking(enabled: false).
         .WithSelfLearning(l => l.Rate(0.12))            // learns from feedback
         .WithMemory(m => m.Capacity(20))                // remembers conversations
+        .WithConversational(c => c.rate(1.5)            // chattier: longer, more conversational
+                                .understand())          // replies + she tracks how the talk
+                                                        // shifts topic to topic (shape of the
+                                                        // conversation, remembered as notes)
         .WithGoals(g => g.AddGoal("make the user smile", 0.9, "kindness"))
         //                            ^ her PRIVATE motivation: it lives in her
         //                              inner prompt (it biases how warmly she
         //                              speaks) — she never says it out loud.
         .WithTools()                                    // clock, calculator, text-stats
-        .WithWebSearch()                                // manual-only web search (/searchweb)
+        .WithAutoWebFetch()                             // manual-only web tools (/searchweb,
+                                                        // /explore) PLUS her autonomous lookup:
+                                                        // unknown topic → she says so naturally,
+                                                        // searches, learns, then answers
         .WithMediaGeneration()                          // real PNG/GIF/AVI/WAV media (cognify_media/)
         .WithPersistence(DbPath, autoSaveEveryCycles: 10)
         .Build();
@@ -421,6 +440,22 @@ string AllowedLevels(ThinkingCeiling c) => c switch
     _ => "Low, Medium, High, Very High, Max"
 };
 
+// "/searchweb \"Flowers\" Look for any information on flowers" →
+//   query = Flowers, focus = "Look for any information on flowers".
+// Without quotes the whole rest is the query (backward compatible).
+(string Query, string Focus) SplitQueryAndFocus(string rest)
+{
+    rest = rest.Trim();
+    if (rest.Length > 1 && rest[0] == '"')
+    {
+        int close = rest.IndexOf('"', 1);
+        if (close > 1)
+            return (rest[1..close].Trim(),
+                    rest[(close + 1)..].Trim().TrimStart('-', ' ', ':'));
+    }
+    return (rest, "");
+}
+
 // ----------------------------------------------------------------------------
 // Slash commands — the control channel. '/' keeps them strictly apart from
 // conversation: nothing here is ever spoken by Yume on her own, and web
@@ -441,12 +476,14 @@ bool HandleSlash(string input, Mind mind)
             Console.WriteLine("  /teach <sentence>      teach her facts line-by-line");
             Console.WriteLine("  /train <file>          bulk-train a corpus file (or a text image!)");
             Console.WriteLine("  /look <image>          read the text in an image without training");
-            Console.WriteLine("  /searchweb <query>     explicit web search — she reads INTO the best result page");
-            Console.WriteLine("  /explore <url>         open any web page and read it (she learns from the text)");
+            Console.WriteLine("  /searchweb \"<q>\" [sugg]  web search — quoted part is the query, the rest steers what she takes from it");
+            Console.WriteLine("  /explore <url> [sugg]    read a page AND follow its internal links (her own WebFetch walk)");
+            Console.WriteLine("  /autofetch on|off        her autonomous lookup: unknown topic → she searches it herself");
             Console.WriteLine("  /improve               run a self-improvement review pass");
             Console.WriteLine("  /predict <text>        show her next-token predictions after your words");
             Console.WriteLine("  /trainbrain [epochs]   deep-train her transformer language model");
             Console.WriteLine("  /brain                 status of her transformer language model");
+            Console.WriteLine("  /export [dir]          export her model bundle (GGUF archive + llama.cpp-runnable gpt2 GGUF + safetensors + tokenizer)");
             Console.WriteLine("  /transcribe <wav>      transcribe speech she synthesized herself");
             Console.WriteLine("  /clone <wav>           clone a voice from a recording");
             Console.WriteLine("  /voice                 show her current voice profile");
@@ -462,6 +499,7 @@ bool HandleSlash(string input, Mind mind)
             Console.WriteLine("  /thinking on|off       can this model think before speaking at all");
             Console.WriteLine("  /showthinking on|off   show her thought trace in chat (hidden by default)");
             Console.WriteLine("  /level <l>             thinking level: low|medium|high|veryhigh|max (clamped by the ceiling)");
+            Console.WriteLine("  /automatic on|off      THINKING AUTOMATIC: she picks the effort per topic (the level becomes the base)");
             Console.WriteLine("  /ceiling <n>           hard cap: only1..only5 — 1=Low only, 2=+Medium, 3=+High, 4=+VeryHigh, 5=everything");
             Console.WriteLine("  /tone <t>              thinking tone: balanced|focused|playful|poetic|plain");
             Console.WriteLine("  /meta on|off           show the response meta line (confidence/style/cycle)");
@@ -492,12 +530,18 @@ bool HandleSlash(string input, Mind mind)
 
         case "/searchweb" or "/search" when rest.Length > 0:
         {
-            Console.WriteLine($"[searching the web for \"{rest}\" — she only searches when you ask, never on her own]");
-            var result = mind.SearchWeb(rest);
+            // /searchweb "Flowers" Look for any information on flowers
+            //   → query = Flowers (what to search), focus = the rest (which
+            //     results matter most — she learns/reports those first).
+            var (query, focus) = SplitQueryAndFocus(rest);
+            Console.WriteLine($"[searching the web for \"{query}\"" +
+                              (focus.Length > 0 ? $" — focusing on: {focus}" : "") +
+                              " — she only searches when you ask, never on her own]");
+            var result = mind.SearchWeb(query, focus.Length > 0 ? focus : null);
             if (result.Success)
             {
                 Console.WriteLine($"Yume : {result.Output.Replace("\\n", $"{Environment.NewLine}       ")}");
-                Console.WriteLine("       [learned from the results and the pages she read: memories stored, clean facts added, next-token model updated]");
+                Console.WriteLine("       [learned from the results: memories stored, clean facts added, next-token model updated]");
             }
             else
             {
@@ -506,21 +550,47 @@ bool HandleSlash(string input, Mind mind)
             return false;
         }
         case "/searchweb" or "/search":
-            Console.WriteLine("[usage: /searchweb <what to look up>]");
+            Console.WriteLine("[usage: /searchweb \"<what to look up>\" [suggestion — what to focus on]]");
             return false;
 
-        case "/explore" or "/visit" or "/read" when rest.Length > 0:
+        case "/explore" when rest.Length > 0:
         {
-            Console.WriteLine($"[opening {rest} — she only reads pages you point her at, never on her own]");
-            var result = mind.ExploreWeb(rest);
+            // /explore https://en.wikipedia.org/wiki/Apple Look for any
+            // information on flowers → reads the page + focus-steered
+            // internal links, learns everything it reads.
+            var parts2 = rest.Split(' ', 2, StringSplitOptions.RemoveEmptyEntries);
+            var url = parts2[0];
+            var focus = parts2.Length > 1 ? parts2[1].Trim() : "";
+            Console.WriteLine($"[exploring {url}" + (focus.Length > 0 ? $" — focusing on: {focus}" : "") + "]");
+            var result = mind.ExploreUrl(url, focus.Length > 0 ? focus : null);
             Console.WriteLine($"Yume : {result.Output.Replace("\\n", $"{Environment.NewLine}       ")}");
             if (result.Success)
-                Console.WriteLine("       [learned from the page: memories stored, clean facts added, next-token model updated]");
+                Console.WriteLine("       [pages → memories (source 'web'), clean sentences → facts, text → next-token model]");
             return false;
         }
-        case "/explore" or "/visit" or "/read":
-            Console.WriteLine("[usage: /explore <url> — e.g. /explore en.wikipedia.org/wiki/Flower]");
+        case "/explore":
+            Console.WriteLine("[usage: /explore <url> [suggestion — what to look for inside the site]]");
             return false;
+
+        case "/autofetch":
+        {
+            bool on = rest is not ("off" or "false" or "0");
+            mind.Config.Tools.AutoFetch(on);
+            Console.WriteLine(on
+                ? "[autonomous lookup ON — when a topic is clearly outside her knowledge she'll say so and search it herself]"
+                : "[autonomous lookup OFF — she'll go online only when you type /searchweb or /explore]");
+            return false;
+        }
+
+        case "/automatic":
+        {
+            bool on = rest is not ("off" or "false" or "0");
+            mind.Config.Thinking.AutomaticOn(on);
+            Console.WriteLine(on
+                ? $"[THINKING AUTOMATIC ON — she picks the effort per topic herself (base {mind.Config.Thinking.Level}, ceiling {mind.Config.Thinking.Ceiling})]"
+                : "[THINKING AUTOMATIC OFF — back to the fixed level]");
+            return false;
+        }
 
         case "/look" when rest.Length > 0:
         {
@@ -683,6 +753,31 @@ bool HandleSlash(string input, Mind mind)
                                 ? $" — transformer ({nlm.ParameterCount:N0} parameters, loss {nlm.LastLoss:F3}) is blending in too"
                                 : " — transformer not trained yet: /trainbrain to train it")
                             + "]");
+            return false;
+        }
+
+        case "/export":
+        {
+            // /export [directory] — writes the full model bundle: the GGUF
+            // archive, the llama.cpp-runnable gpt2 GGUF (when her transformer
+            // is trained), safetensors, tokenizer and the llama.cpp set.
+            var dir = rest.Length > 0 ? ResolvePath(rest) : Path.Combine(Environment.CurrentDirectory, "export");
+            Console.WriteLine($"[exporting her model bundle to {dir}]");
+            try
+            {
+                var files = Cognify.Export.MindExporter.ExportBundle(mind, dir);
+                foreach (var file in files) Console.WriteLine($"  wrote {file}");
+                var runnable = files.FirstOrDefault(f => f.EndsWith("-llamacpp.gguf", StringComparison.Ordinal));
+                if (runnable is not null)
+                    Console.WriteLine($"[the -llamacpp.gguf file loads in llama.cpp / Unsloth / llama-cpp-python — " +
+                                      "her transformer as a standard gpt2 model]");
+                else
+                    Console.WriteLine("[tip: /trainbrain first — then /export also writes a llama.cpp-runnable gpt2 GGUF]");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[export failed: {ex.Message}]");
+            }
             return false;
         }
 

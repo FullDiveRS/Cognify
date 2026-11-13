@@ -104,6 +104,25 @@ public sealed class MindBuilder
         return this;
     }
 
+    /// <summary>
+    /// Configures how TALKATIVE the mind is and how much it collects from
+    /// the conversation:
+    /// <code>
+    /// .WithConversational(c => c.rate(1.5)   // chattier, longer replies
+    ///                         .understand()) // track how topics shift
+    /// </code>
+    /// <paramref name="configure"/> tunes <see cref="ConversationalOptions"/>:
+    /// <c>rate(amount)</c> scales reply length (1.0 default; 1.5+ adds
+    /// conversational sentences drawn from related knowledge, memories and
+    /// the conversation itself), <c>understand()</c> keeps topic-shift notes
+    /// so recall knows the SHAPE of the conversation, not just lines.
+    /// </summary>
+    public MindBuilder WithConversational(Action<ConversationalOptions>? configure = null)
+    {
+        configure?.Invoke(_config.Conversational);
+        return this;
+    }
+
     /// <summary>Enables the self-learning module (micro neural net + reinforcement + induction).</summary>
     public MindBuilder WithSelfLearning(Action<LearningOptions>? configure = null, bool enabled = true)
     {
@@ -233,16 +252,36 @@ public sealed class MindBuilder
 
     /// <summary>
     /// Enables the tool-use module AND registers the manual-only
-    /// <c>web-search</c> tool (DuckDuckGo HTTP backend unless a custom
-    /// <c>Tools.WebSearchBackend</c> was assigned). Web search never fires on
-    /// its own inside the cognitive cycle — it runs only when explicitly
-    /// requested via <see cref="Mind.SearchWeb"/> or the demo's
-    /// <c>/searchweb</c> command.
+    /// <c>web-search</c> tool (multi-engine chain: Google News → Wikipedia →
+    /// Bing, unless a custom <c>Tools.WebSearchBackend</c> was assigned).
+    /// Web search never fires on its own inside the cognitive cycle — it
+    /// runs only when explicitly requested via <see cref="Mind.SearchWeb"/>
+    /// or the demo's <c>/searchweb</c> command.
     /// </summary>
     public MindBuilder WithWebSearch(Action<ToolOptions>? configure = null, bool enabled = true)
     {
         _enabled["tools"] = enabled;
         _config.Tools.AllowWebSearch = enabled;
+        configure?.Invoke(_config.Tools);
+        return this;
+    }
+
+    /// <summary>
+    /// Gives the mind AUTONOMOUS WEB LOOKUP — her own WebFetch. When a
+    /// conversational topic is clearly outside her knowledge, she says so
+    /// naturally ("I don't know much about X, but I'll search it and
+    /// understand it a bit more"), looks it up herself, learns from the
+    /// results, and answers from what she found. Registers the manual-only
+    /// <c>web-search</c> and <c>web-fetch</c> tools too (so /searchweb and
+    /// /explore keep working), but the auto path is the new ability: still
+    /// guarded — one lookup per unfamiliar topic, no arithmetic/identity
+    /// triggers, failed lookups stay silent. Requires the tools module.
+    /// </summary>
+    public MindBuilder WithAutoWebFetch(Action<ToolOptions>? configure = null, bool enabled = true)
+    {
+        _enabled["tools"] = enabled;
+        _config.Tools.AllowWebSearch = true;
+        _config.Tools.AutoFetchWeb = enabled;
         configure?.Invoke(_config.Tools);
         return this;
     }
@@ -414,16 +453,16 @@ public sealed class MindBuilder
         var mind = new Mind(_config, modules, seed);
 
         // Register the manual-only web tools when enabled. They are
-        // explicitly NOT auto-invocable — see WebSearchTool.ManualOnly.
+        // explicitly NOT auto-invocable — see WebSearchTool.ManualOnly and
+        // WebFetchTool.ManualOnly (the AutoFetchWeb gap-lookup path is a
+        // separate, explicit builder decision, not a trigger phrase).
         if (_config.Tools.AllowWebSearch && mind.Tools is { } tools)
         {
             if (tools.Registry.Get("web-search") is null)
                 tools.Registry.Register(new Cognify.Tools.WebSearchTool(
                     _config.Tools.WebSearchBackend as Cognify.Tools.IWebSearchBackend));
-            if (tools.Registry.Get("web-explore") is null)
-                tools.Registry.Register(new Cognify.Tools.WebExploreTool(
-                    _config.Tools.WebPageFetcher as Cognify.Tools.IWebPageFetcher,
-                    _config.Tools.WebExploration));
+            if (tools.Registry.Get("web-fetch") is null)
+                tools.Registry.Register(new Cognify.Tools.WebFetchTool());
         }
 
         if (_config.Persistence.SqlitePath is { } path)

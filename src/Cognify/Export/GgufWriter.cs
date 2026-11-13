@@ -5,7 +5,10 @@ namespace Cognify.Export;
 /// <summary>A named F32 tensor to embed in GGUF / safetensors files.</summary>
 public sealed class TensorSpec
 {
-    /// <summary>Creates a tensor. Dimensions are row-major (GGML convention).</summary>
+    /// <summary>Creates a tensor from a row-major payload. <paramref name="shape"/>
+    /// is the LOGICAL shape, outer dimension first (shape[0] = rows, shape[1] =
+    /// columns for a matrix) — the writer converts to GGML's ne order, where
+    /// ne[0] must be the fastest-varying (innermost) dimension.</summary>
     public TensorSpec(string name, float[] data, params long[] shape)
     {
         Name = name;
@@ -19,7 +22,7 @@ public sealed class TensorSpec
     /// <summary>Flat row-major payload.</summary>
     public float[] Data { get; }
 
-    /// <summary>Dimensions, e.g. [hidden, input] for a 2-D weight matrix.</summary>
+    /// <summary>Logical dimensions, outer first — e.g. [rows, cols] for a 2-D weight matrix.</summary>
     public long[] Shape { get; }
 
     /// <summary>Total element count.</summary>
@@ -27,6 +30,13 @@ public sealed class TensorSpec
 
     /// <summary>Size of the raw payload in bytes (F32 = 4 bytes per element).</summary>
     public long ByteLength => ElementCount * 4;
+}
+
+/// <summary>GGML tensor element types (subset — the writer emits F32 only).</summary>
+public static class GgmlType
+{
+    /// <summary>32-bit IEEE float — GGML type id 0.</summary>
+    public const uint F32 = 0;
 }
 
 /// <summary>
@@ -38,24 +48,22 @@ public enum GgufValueType : uint
     Float32 = 6, Bool = 7, String = 8, Array = 9, UInt64 = 10, Int64 = 11, Float64 = 12
 }
 
-/// <summary>GGML tensor element types (subset — the writer emits F32 only).</summary>
-public static class GgmlType
-{
-    /// <summary>32-bit IEEE float — GGML type id 0.</summary>
-    public const uint F32 = 0;
-}
-
 /// <summary>
 /// A spec-compliant <b>GGUF v3</b> writer (little-endian) following the format
 /// defined by llama.cpp's gguf spec:
 /// <list type="bullet">
 /// <item>Magic <c>GGUF</c> (u32), version (u32) = 3, tensor_count (u64), kv_count (u64).</item>
 /// <item>Key-value metadata: each entry is a string key + value-type (u32) + value.</item>
-/// <item>Tensor infos: name, n_dims (u32), shape (u64 each), ggml type (u32), offset (u64).</item>
+/// <item>Tensor infos: name, n_dims (u32), ne (u64 each, <b>GGML order — ne[0] is
+/// the fastest-varying dimension</b>, i.e. the logical shape written reversed),
+/// ggml type (u32), offset (u64).</item>
+/// <item>Tensor offsets are <b>relative to the start of the tensor data
+/// section</b> (the first tensor sits at offset 0) — absolute file positions
+/// make every spec-conformant reader (llama.cpp, gguf-py) read the wrong bytes.</item>
 /// <item>Tensor data region aligned to <c>general.alignment</c> (default 32 bytes).</item>
 /// </list>
-/// The produced files can be inspected with <c>gguf-dump</c> (gguf-py) and
-/// requantized with <c>llama-quantize</c>.
+/// The produced files can be inspected with <c>gguf-dump</c> (gguf-py), read
+/// back with <see cref="GgufReader"/>, and requantized with <c>llama-quantize</c>.
 /// </summary>
 public sealed class GgufWriter
 {
@@ -152,23 +160,29 @@ public sealed class GgufWriter
 
         // ---- Tensor infos with pre-computed aligned offsets ---------------
         // The data region starts AFTER the whole info block, so its size must
-        // be computed upfront (name len + n_dims + shape + type + offset).
+        // be computed upfront (name len + n_dims + ne + type + offset).
+        // Offsets are RELATIVE to the data section (spec: "the offset of the
+        // tensor data within the tensor data section") — the first tensor is
+        // at offset 0. Shapes are written in GGML ne order: ne[0] is the
+        // fastest-varying (innermost) dimension, so the logical shape (outer
+        // first) is written REVERSED.
         long infoSize = 0;
         foreach (var tensor in _tensors)
         {
             infoSize += 8 + Encoding.UTF8.GetByteCount(tensor.Name); // name
             infoSize += 4;                                           // n_dims
-            infoSize += 8 * tensor.Shape.Length;                     // shape
+            infoSize += 8 * tensor.Shape.Length;                     // ne
             infoSize += 4;                                           // ggml type
             infoSize += 8;                                           // offset
         }
         long dataStart = Align(w.BaseStream.Position + infoSize, alignment);
-        long offset = dataStart;
+        long offset = 0;
         foreach (var tensor in _tensors)
         {
             WriteString(w, tensor.Name);
             w.Write((uint)tensor.Shape.Length);
-            foreach (var dim in tensor.Shape) w.Write((ulong)dim);
+            for (int d = tensor.Shape.Length - 1; d >= 0; d--)
+                w.Write((ulong)tensor.Shape[d]);                     // ne[0] = innermost
             w.Write(GgmlType.F32);
             w.Write((ulong)offset);
             offset = Align(offset + tensor.ByteLength, alignment);

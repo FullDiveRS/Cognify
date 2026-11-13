@@ -83,6 +83,10 @@ public sealed class PhrasePool
     public IReadOnlyList<string> PickRelevant(string contextText, Random rng, int max)
     {
         if (max <= 0) return Array.Empty<string>();
+        lock (_gate)
+        {
+            if (_sayings.Count == 0) return Array.Empty<string>();
+        }
         var contextWords = ContentWords(contextText ?? "");
         if (contextWords.Count == 0) return RotatedSample(rng, max);
 
