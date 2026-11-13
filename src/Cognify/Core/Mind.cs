@@ -376,6 +376,13 @@ public sealed class Mind : IDisposable
         }
         ctx = new CognitiveContext(this, cycle, stimulus);
 
+        // CONVERSATIONAL UNDERSTANDING — when WithConversational(c =>
+        // c.understand()) is on (the default), the mind tracks how the talk
+        // moves from topic to topic. Whenever the subject shifts, a compact
+        // note lands in memory (source "conversation"), so later recall knows
+        // the SHAPE of the conversation — not just isolated lines.
+        TrackConversationTopic(stimulus);
+
         foreach (var module in _modules.ToArray())
         {
             try
@@ -677,25 +684,21 @@ public sealed class Mind : IDisposable
     /// next-token language model. Words from the query are marked as spoken
     /// so the mind stops asking what they mean.
     ///
-    /// Then she READS INTO the web (when <c>WebExploration.ExploreResults</c>
-    /// is on, the default): the most query-relevant result page is opened,
-    /// its readable text — not the 140-character snippet — feeds memories,
-    /// facts and the language models, and when that page is a poor match the
-    /// explorer steps through the in-page link that matches the query best
-    /// (a site's front door becomes the actual article). A search result is
-    /// only a doorway; this is what stops her from being locked to the
-    /// search engine's snippets.
+    /// <para><paramref name="focus"/> is the demo's suggestion argument —
+    /// <c>/searchweb "Flowers" Look for any information on flowers</c>. The
+    /// quoted part stays the search query; the suggestion STEERS what she
+    /// takes from the results: hits matching the focus words are learned
+    /// first and reported first.</para>
     ///
-    /// This is deliberately the ONLY path to web search: the tool is
+    /// This is deliberately the ONLY explicit path to web search: the tool is
     /// manual-only and never auto-fires inside the cognitive cycle, so the
-    /// mind goes online exactly when asked — never on its own. Reading one
-    /// page further is part of the same consent: the user asked for the
-    /// lookup, the page IS the lookup.
+    /// mind goes online exactly when asked (or, with WithAutoWebFetch, when
+    /// SHE notices a knowledge gap — that path runs through here too).
     /// Throws <see cref="MindConfigurationException"/> when tools are
     /// disabled and the mind is not lenient; in lenient mode a failed result
     /// is returned instead.
     /// </summary>
-    public Cognify.Tools.ToolResult SearchWeb(string query)
+    public Cognify.Tools.ToolResult SearchWeb(string query, string? focus = null)
     {
         if (string.IsNullOrWhiteSpace(query))
             return Cognify.Tools.ToolResult.Fail("No search query given.");
@@ -714,83 +717,182 @@ public sealed class Mind : IDisposable
             tools.Registry.Register(new Cognify.Tools.WebSearchTool(
                 Config.Tools.WebSearchBackend as Cognify.Tools.IWebSearchBackend));
 
-        var result = tools.Invoke("web-search",
-            new Dictionary<string, string> { ["query"] = query.Trim() }, query);
-        if (!result.Success)
-            return result;
-
-        LearnFromWeb(query.Trim(), result);
-
-        // Read INTO the results: open the best-matching page and learn from
-        // the page itself. Failures here must not fail the search — the
-        // results are already in.
-        if (Config.Tools.WebExploration.ExploreResults)
-        {
-            var (section, pages) = ExploreResultsFor(query.Trim(), result);
-            if (section.Length > 0)
-            {
-                LearnFromPages(pages, query.Trim());
-                Stream?.Add("web", $"read into {pages.Count} page(s) the search pointed at and learned from their text");
-                var data = new Dictionary<string, object>(result.Data) { ["pages"] = pages };
-                return Cognify.Tools.ToolResult.Ok(result.Output + section, data);
-            }
-        }
+        var args = new Dictionary<string, string> { ["query"] = query.Trim() };
+        if (!string.IsNullOrWhiteSpace(focus)) args["focus"] = focus.Trim();
+        var result = tools.Invoke("web-search", args, query);
+        if (result.Success)
+            LearnFromWeb(query.Trim(), result, focus);
         return result;
     }
 
     /// <summary>
-    /// Explicit web exploration: opens ONE page and reads it — the readable
-    /// text of the page itself (scripts, styles and site chrome stripped),
-    /// not a search snippet — and learns from it: memories, knowledge-base
-    /// facts, both language models. When the exploration options allow, the
-    /// reader steps through an in-page link that better matches what the
-    /// user asked for. This is the direct "read that site" path, so the mind
-    /// is never locked to a search engine's result list.
-    ///
-    /// Manual-only by construction: nothing in the cognitive cycle calls
-    /// this — the mind opens pages exactly when asked, never on its own.
+    /// Her own WebFetch-and-explore: reads a starting page and FOLLOWS its
+    /// internal links (same host, focus-steered) so the mind is not locked
+    /// to one page or one search engine — <c>/explore https://… wiki/Apple
+    /// Look for any information on flowers</c> reads the page plus related
+    /// pages whose addresses/anchors match the suggestion. Everything read
+    /// LEARNS: page texts become recallable memories (source "web"), clean
+    /// factual sentences become knowledge facts, and the text feeds the
+    /// next-token language model. Focus words count as known afterwards.
+    /// Manual by nature — only a caller (the demo command, a program) runs
+    /// it; the cognitive cycle never explores on its own.
     /// Throws <see cref="MindConfigurationException"/> when tools are
     /// disabled and the mind is not lenient; in lenient mode a failed result
     /// is returned instead.
     /// </summary>
-    public Cognify.Tools.ToolResult ExploreWeb(string url)
+    public Cognify.Tools.ToolResult ExploreUrl(string url, string? focus = null)
     {
         if (string.IsNullOrWhiteSpace(url))
-            return Cognify.Tools.ToolResult.Fail("No page address given. Usage: /explore <url>.");
-        var tools = Tools;
-        if (tools is null)
-        {
-            if (!Config.LenientMode)
-                throw new MindConfigurationException("Tool use is not enabled; enable it with WithTools() or WithWebSearch().");
+            return Cognify.Tools.ToolResult.Fail("No web url given. Usage: /explore <url> [suggestion].");
+        if (Tools is null && !Config.LenientMode)
+            throw new MindConfigurationException("Tool use is not enabled; enable it with WithTools() or WithWebSearch().");
+        if (Tools is null)
             return Cognify.Tools.ToolResult.Fail(
-                "Web exploration is not enabled (lenient mode: no page was opened).");
-        }
+                "Web exploration is not enabled (lenient mode: nothing was read).");
 
-        // Restored minds may predate the web-explore registration — make sure
-        // the tool exists before invoking it.
-        if (tools.Registry.Get("web-explore") is null)
-            tools.Registry.Register(new Cognify.Tools.WebExploreTool(
-                Config.Tools.WebPageFetcher as Cognify.Tools.IWebPageFetcher,
-                Config.Tools.WebExploration));
-
-        var result = tools.Invoke("web-explore",
-            new Dictionary<string, string> { ["url"] = url.Trim() }, url);
-        if (result.Success &&
-            result.Data.TryGetValue("pages", out var raw) &&
-            raw is IReadOnlyList<Cognify.Tools.WebPage> pages && pages.Count > 0)
+        var explorer = new Cognify.Tools.WebExplorer(maxPages: Config.Tools.ExploreMaxPages);
+        IReadOnlyList<Cognify.Tools.WebPage> pages;
+        try
         {
-            LearnFromPages(pages, "");
-            Stream?.Add("web", $"read the page {Truncate(pages[0].Url, 60)} and learned from its text");
+            pages = explorer.Explore(url.Trim(), focus);
         }
-        return result;
+        catch (Cognify.Tools.WebSearchException ex)
+        {
+            var advice = ex.Reason switch
+            {
+                Cognify.Tools.WebSearchFailure.Offline =>
+                    "Reading a page needs an internet connection — check the network and try again.",
+                _ => "That address did not look like a readable web page. Try another url.",
+            };
+            return Cognify.Tools.ToolResult.Fail($"I could not explore {url}: {ex.Message}. {advice}");
+        }
+        catch (Exception ex)
+        {
+            return Cognify.Tools.ToolResult.Fail($"I could not explore {url}: {ex.Message}.");
+        }
+
+        if (pages.Count == 0)
+            return Cognify.Tools.ToolResult.Fail(
+                $"I could not read anything at {url} — the site refused or the page had no readable text. Try another url.");
+
+        LearnFromPages(pages, focus);
+
+        var lines = new List<string>
+        {
+            $"I explored \"{pages[0].Title}\"" +
+            (pages.Count > 1 ? $" and followed {pages.Count - 1} related page(s) inside the site" : "") +
+            ":"
+        };
+        for (int i = 0; i < pages.Count; i++)
+            lines.Add($" {i + 1}. {pages[i].Title} — {pages[i].Excerpt(160)} ({HostOf(pages[i].Url)})");
+        lines.Add("It is all in my memory now — ask me about it anytime.");
+
+        return Cognify.Tools.ToolResult.Ok(string.Join("\n", lines),
+            new Dictionary<string, object>
+            {
+                ["url"] = url.Trim(),
+                ["pages"] = pages,
+                ["titles"] = pages.Select(p => p.Title).ToList(),
+            });
     }
 
-    private void LearnFromWeb(string query, Cognify.Tools.ToolResult result)
+    private static string HostOf(string url)
+    {
+        try { return new Uri(url).Host; }
+        catch (UriFormatException) { return ""; }
+    }
+
+    /// <summary>Feeds explored pages into memory, knowledge and language.</summary>
+    private void LearnFromPages(IReadOnlyList<Cognify.Tools.WebPage> pages, string? focus)
+    {
+        // 1. Recallable memories — she "remembers" what she read.
+        int stored = 0;
+        foreach (var page in pages)
+        {
+            foreach (var chunk in Chunk(page.Text, 400).Take(2))
+            {
+                Memory?.Remember($"Web: {page.Title}. {chunk} (source: {page.Url})",
+                    MemoryKind.LongTerm, importance: 0.6, source: "web");
+                if (++stored >= 4) break;
+            }
+            if (stored >= 4) break;
+        }
+
+        // 2. Knowledge: clean factual sentences in the page text become facts.
+        if (Reasoning is { } reasoning)
+        {
+            int added = 0;
+            foreach (var page in pages)
+            {
+                foreach (var fact in FactParser.Parse(page.Text))
+                {
+                    var sourced = new Fact(fact.Subject, fact.Predicate, fact.Object,
+                        Math.Min(fact.Confidence, 0.6), "web");
+                    if (reasoning.Knowledge.Add(sourced)) added++;
+                    if (added >= 5) break;
+                }
+                if (added >= 5) break;
+            }
+        }
+
+        // 3. Language + vocabulary: page text feeds next-token prediction;
+        //    the focus words count as known now.
+        foreach (var page in pages.Take(2))
+            ObserveLanguage(page.Text.Length > 2000 ? page.Text[..2000] : page.Text);
+        if (!string.IsNullOrWhiteSpace(focus) && Lexicon is { } lex)
+            foreach (var word in Emotions.MoodEngine.Tokenize(focus))
+                if (word.Length > 2)
+                    lex.MarkSpoken(word);
+
+        Stream?.Add("web", $"explored {Truncate(pages[0].Url, 60)} ({pages.Count} page(s)) and learned from what it read");
+    }
+
+    /// <summary>Splits text into readable chunks (memory-sized paragraphs).</summary>
+    private static IEnumerable<string> Chunk(string text, int size)
+    {
+        for (int i = 0; i < text.Length; i += size)
+            yield return text.Substring(i, Math.Min(size, text.Length - i));
+    }
+
+    /// <summary>
+    /// Conversational understanding: tracks the talk's topic from cycle to
+    /// cycle and remembers each shift (source "conversation"). One note per
+    /// shift, importance modest — recall uses it to know how the talk moved,
+    /// not as a fact about the world.
+    /// </summary>
+    private string? _lastConversationTopic;
+
+    private void TrackConversationTopic(Stimulus stimulus)
+    {
+        if (!Config.Conversational.Understand) return;
+        if (stimulus.Kind is StimulusKind.Image or StimulusKind.Audio
+            or StimulusKind.Video or StimulusKind.Feedback) return;
+        var text = stimulus.Content;
+        if (string.IsNullOrWhiteSpace(text)) return;
+
+        var topic = Cognify.Thinking.ResponseComposer.TopicOf(text);
+        if (topic.Length == 0 || topic == "that") return;
+        if (_lastConversationTopic is { } prev &&
+            !prev.Equals(topic, StringComparison.OrdinalIgnoreCase))
+        {
+            Memory?.Remember($"The conversation moved from {prev} to {topic}.",
+                MemoryKind.LongTerm, importance: 0.5, source: "conversation");
+            Stream?.Add("conversation", $"the talk shifted: {prev} → {topic}");
+        }
+        _lastConversationTopic = topic;
+    }
+
+    private void LearnFromWeb(string query, Cognify.Tools.ToolResult result, string? focus = null)
     {
         var results = result.Data.TryGetValue("results", out var raw) &&
                       raw is IReadOnlyList<Cognify.Tools.WebSearchResult> list
             ? list
             : null;
+
+        // The focus suggestion steers what she takes from the results: hits
+        // matching the focus words are learned and reported first.
+        if (results is not null && !string.IsNullOrWhiteSpace(focus))
+            results = Cognify.Tools.WebSearchTool.RankByFocus(results, focus);
 
         // 1. Recallable memories — she "remembers" what she read online.
         if (results is not null)
@@ -825,147 +927,21 @@ public sealed class Mind : IDisposable
         }
 
         // 3. Language + vocabulary: the text feeds next-token prediction, and
-        //    the query's words count as known now — she looked them up instead
-        //    of asking what they mean.
+        //    the query's (and focus suggestion's) words count as known now —
+        //    she looked them up instead of asking what they mean.
         ObserveLanguage(result.Output);
         if (Lexicon is { } lex)
+        {
             foreach (var word in Emotions.MoodEngine.Tokenize(query))
                 if (word.Length > 2)
                     lex.MarkSpoken(word);
+            if (!string.IsNullOrWhiteSpace(focus))
+                foreach (var word in Emotions.MoodEngine.Tokenize(focus))
+                    if (word.Length > 2)
+                        lex.MarkSpoken(word);
+        }
 
         Stream?.Add("web", $"searched the web for: {Truncate(query, 60)} and learned from the results");
-    }
-
-    // Cached reader: one HttpClient-backed explorer per mind (re-created only
-    // if a custom fetcher is assigned after first use).
-    private Cognify.Tools.WebExplorer? _webExplorer;
-
-    private Cognify.Tools.WebExplorer WebExplorerInstance() =>
-        _webExplorer ??= new Cognify.Tools.WebExplorer(
-            Config.Tools.WebPageFetcher as Cognify.Tools.IWebPageFetcher,
-            Config.Tools.WebExploration);
-
-    /// <summary>
-    /// Opens the search results' most query-relevant page (and, when the
-    /// options allow, follows a more relevant in-page link) and returns the
-    /// report section for the chat plus the pages read. Candidates are tried
-    /// in relevance order — if the first page turns out not to mention the
-    /// query at all, the next best result gets the chance, so a brand-dominated
-    /// SERP ("wikipedia flowers") cannot make the actual topic vanish.
-    /// </summary>
-    private (string Section, IReadOnlyList<Cognify.Tools.WebPage> Pages) ExploreResultsFor(
-        string query, Cognify.Tools.ToolResult result)
-    {
-        var results = result.Data.TryGetValue("results", out var raw) &&
-                      raw is IReadOnlyList<Cognify.Tools.WebSearchResult> list
-            ? list
-            : null;
-        if (results is null || results.Count == 0)
-            return ("", Array.Empty<Cognify.Tools.WebPage>());
-
-        var keywords = Cognify.Tools.WebRelevance.Keywords(query);
-        var explorer = WebExplorerInstance();
-        Cognify.Tools.WebExploration? fallback = null;
-
-        foreach (var candidate in Cognify.Tools.WebRelevance.RankResults(query, results).Take(2))
-        {
-            try
-            {
-                var exploration = explorer.Explore(query, candidate.Url);
-                if (exploration.CombinedText.Length == 0)
-                    continue;
-                if (keywords.Count == 0 ||
-                    keywords.Any(kw => Cognify.Tools.WebRelevance.Has(exploration.CombinedText, kw)))
-                    return (ExplorationSection(query, exploration), exploration.Pages);
-                fallback ??= exploration;   // readable, but does not mention the topic — keep as backup
-            }
-            catch (Cognify.Tools.WebSearchException)
-            {
-                // This candidate is unreadable (bot-check, PDF, offline page) —
-                // the next result gets the chance.
-            }
-        }
-        return fallback is null
-            ? ("", Array.Empty<Cognify.Tools.WebPage>())
-            : (ExplorationSection(query, fallback), fallback.Pages);
-    }
-
-    /// <summary>The "I also read into ..." chat section for an exploration.</summary>
-    private static string ExplorationSection(string query, Cognify.Tools.WebExploration exploration)
-    {
-        var keywords = Cognify.Tools.WebRelevance.Keywords(query);
-        var lines = new List<string> { "", "I also read into the most relevant page to learn more:" };
-        foreach (var page in exploration.Pages)
-        {
-            var host = HostOf(page.Url);
-            var title = page.Title.Length > 0 ? Truncate(page.Title, 90) : host;
-            lines.Add($" • {title} ({host})");
-            var highlight = Cognify.Tools.WebRelevance.KeySentences(page.Text, keywords, 1, 200);
-            var preview = highlight.Count > 0
-                ? highlight[0]
-                : Truncate(page.Text.Replace('\n', ' '), 160);
-            if (preview.Length > 0)
-                lines.Add($"   {preview}");
-        }
-        return string.Join("\n", lines);
-    }
-
-    /// <summary>
-    /// Learns from pages she actually read: query-relevant highlights become
-    /// recallable memories, clean factual sentences become knowledge-base
-    /// facts (source "web"), the full readable text feeds both language
-    /// models, and the query's words count as spoken (she looked them up).
-    /// </summary>
-    private void LearnFromPages(IReadOnlyList<Cognify.Tools.WebPage> pages, string query)
-    {
-        var keywords = Cognify.Tools.WebRelevance.Keywords(query);
-
-        // 1. Recallable memories — she remembers what the pages said.
-        foreach (var page in pages.Take(2))
-        {
-            var highlights = Cognify.Tools.WebRelevance.KeySentences(page.Text, keywords, 2, 240);
-            var gist = highlights.Count > 0
-                ? string.Join(" ", highlights)
-                : Truncate(page.Text.Replace('\n', ' '), 180);
-            Memory?.Remember(
-                $"Web page: {Truncate(page.Title, 80)}. {gist} (source: {page.Url})",
-                MemoryKind.LongTerm, importance: 0.65, source: "web");
-        }
-
-        // 2. Knowledge: clean factual sentences on the page become facts.
-        if (Reasoning is { } reasoning)
-        {
-            int added = 0;
-            foreach (var page in pages)
-            {
-                foreach (var sentence in Cognify.Tools.WebRelevance.KeySentences(page.Text, keywords, 8, 700))
-                {
-                    foreach (var fact in FactParser.Parse(sentence))
-                    {
-                        var sourced = new Fact(fact.Subject, fact.Predicate, fact.Object,
-                            Math.Min(fact.Confidence, 0.7), "web");
-                        if (reasoning.Knowledge.Add(sourced))
-                            added++;
-                        if (added >= 3) break;
-                    }
-                    if (added >= 3) break;
-                }
-                if (added >= 3) break;
-            }
-        }
-
-        // 3. Language + vocabulary: the page text feeds the language models.
-        ObserveLanguage(string.Join("\n", pages.Select(p => p.Text)));
-        if (query.Length > 0 && Lexicon is { } lex)
-            foreach (var word in Emotions.MoodEngine.Tokenize(query))
-                if (word.Length > 2)
-                    lex.MarkSpoken(word);
-    }
-
-    private static string HostOf(string url)
-    {
-        try { return new Uri(url).Host; }
-        catch (UriFormatException) { return url; }
     }
 
     // ------------------------------------------------------------------
@@ -1237,14 +1213,22 @@ public sealed class Mind : IDisposable
     {
         // Minimal composer used when the thinking module is disabled.
         // Memory content is the user's own words, so it is referenced
-        // obliquely (never quoted back verbatim).
+        // obliquely (never quoted back verbatim). The conversational rate
+        // still applies — a talkative mind is talkative with or without the
+        // full thinking machinery.
+        var topic = ResponseComposer.TopicOf(ctx.Stimulus.Content);
+        string body;
         if (ctx.Recalled.Count > 0)
         {
             var memoryTopic = ResponseComposer.TopicOf(ctx.Recalled[0].Content);
-            return new ResponseDraft(
-                $"That connects with what you told me earlier about {memoryTopic}.", 0.4, -1, "fallback");
+            body = $"That connects with what you told me earlier about {memoryTopic}.";
         }
-        return new ResponseDraft($"I registered '{Truncate(ctx.Stimulus.Content, 60)}'.", 0.3, -1, "fallback");
+        else
+        {
+            body = $"I registered '{Truncate(ctx.Stimulus.Content, 60)}'.";
+        }
+        body = ResponseComposer.ExtendConversationally(ctx, body, topic);
+        return new ResponseDraft(body, ctx.Recalled.Count > 0 ? 0.4 : 0.3, -1, "fallback");
     }
 
     internal static string Truncate(string text, int max) =>

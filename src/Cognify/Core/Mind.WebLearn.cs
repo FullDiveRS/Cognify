@@ -1,0 +1,1 @@
+// NOTE: This partial-class file is not used by the build (see Mind.cs) — placeholder overwritten below.

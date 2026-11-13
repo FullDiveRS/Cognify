@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http;
 using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using Cognify.Core;
 
@@ -50,9 +51,12 @@ public interface IWebSearchEngine
 
 /// <summary>
 /// A pluggable web search backend. The default implementation tries several
-/// keyhole-free engines in order (Bing, then DuckDuckGo lite, then DuckDuckGo
-/// html); plug in your own (SerpAPI, a local index...) by implementing this
-/// interface and passing it to <see cref="WebSearchTool"/>.
+/// keyhole-free engines in order (Google News, then Wikipedia, then Bing),
+/// rejecting any engine whose results do not actually MATCH the query's
+/// words (the relevance gate keeps junk out — see
+/// <see cref="HttpWebSearchBackend"/>); plug in your own (SerpAPI, a local
+/// index...) by implementing this interface and passing it to
+/// <see cref="WebSearchTool"/>.
 /// </summary>
 public interface IWebSearchBackend
 {
@@ -87,35 +91,8 @@ public abstract class HttpSearchEngineBase : IWebSearchEngine
             using var response = http.GetAsync(url).ConfigureAwait(false).GetAwaiter().GetResult();
             var body = response.Content.ReadAsStringAsync().ConfigureAwait(false)
                            .GetAwaiter().GetResult();
-            // DuckDuckGo answers bot checks with HTTP 202 + a challenge page —
+            // Some engines answer bot checks with HTTP 202 + a challenge page —
             // "success" by status code, but there is nothing to parse.
-            if ((int)response.StatusCode == 202 || IsAnomalyPage(body))
-                throw new WebSearchException($"{Name} answered with a bot-check page",
-                    WebSearchFailure.Blocked);
-            if (response.StatusCode is HttpStatusCode.Forbidden or HttpStatusCode.TooManyRequests)
-                throw new WebSearchException($"{Name} refused the request ({(int)response.StatusCode})",
-                    WebSearchFailure.Blocked);
-            response.EnsureSuccessStatusCode();
-            return body;
-        }
-        catch (WebSearchException) { throw; }
-        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or WebException)
-        {
-            throw new WebSearchException($"{Name} could not be reached ({RootCause(ex)})",
-                WebSearchFailure.Offline, ex);
-        }
-    }
-
-    /// <summary>Performs a form POST and returns the body; classifies HTTP-level failures.</summary>
-    protected string Post(HttpClient http, string url, Dictionary<string, string> form)
-    {
-        try
-        {
-            using var content = new FormUrlEncodedContent(form);
-            using var response = http.PostAsync(url, content).ConfigureAwait(false)
-                                     .GetAwaiter().GetResult();
-            var body = response.Content.ReadAsStringAsync().ConfigureAwait(false)
-                           .GetAwaiter().GetResult();
             if ((int)response.StatusCode == 202 || IsAnomalyPage(body))
                 throw new WebSearchException($"{Name} answered with a bot-check page",
                     WebSearchFailure.Blocked);
@@ -149,20 +126,9 @@ public abstract class HttpSearchEngineBase : IWebSearchEngine
         return Regex.Replace(text, @"\s+", " ").Trim();
     }
 
-    /// <summary>Unwraps DuckDuckGo redirect links (/l/?uddg=&lt;encoded real url&gt;).</summary>
-    internal static string UnwrapDdgUrl(string url)
-    {
-        var idx = url.IndexOf("uddg=", StringComparison.Ordinal);
-        if (idx >= 0)
-        {
-            var encoded = url[(idx + 5)..];
-            var end = encoded.IndexOf('&');
-            if (end > 0) encoded = encoded[..end];
-            try { return Uri.UnescapeDataString(encoded); }
-            catch (UriFormatException) { return url; }
-        }
-        return url;
-    }
+    /// <summary>Unwraps Google News redirect links (/rss/articles/... keep as-is; the
+    /// link resolves to the real article when opened). Kept for symmetry.</summary>
+    internal static string UnwrapGoogleUrl(string url) => url;
 
     /// <summary>Short, human-readable network error ("no such host", "timed out"...).</summary>
     internal static string RootCause(Exception ex)
@@ -179,11 +145,158 @@ public abstract class HttpSearchEngineBase : IWebSearchEngine
 }
 
 /// <summary>
-/// Bing web search (first engine in the default chain). Uses Bing's RSS
-/// output (<c>format=rss</c>) — a small, stable, bot-resistant page with
-/// direct links and real snippets; the HTML scrape of b_algo blocks served
-/// randomized junk to lightweight clients. RSS descriptions are tag-stripped
-/// and entity-decoded; /ck/a-style links are unwrapped defensively.
+/// Google web search (first engine in the default chain). Google's regular
+/// results page requires JavaScript, but Google NEWS offers a clean RSS
+/// feed (<c>news.google.com/rss/search</c>) — keyless, bot-resistant, and
+/// genuinely relevant: a query about flowers returns flower articles, never
+/// the randomized junk the other scrapes serve to lightweight clients.
+/// Items carry the real publisher in <c>&lt;source url="..."&gt;</c>; the
+/// article link is a Google redirect that resolves when opened.
+/// </summary>
+public sealed class GoogleNewsSearchEngine : HttpSearchEngineBase
+{
+    private static readonly Regex ItemRegex =
+        new(@"<item>(.*?)</item>", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.Singleline);
+    private static readonly Regex TitleRegex =
+        new(@"<title>(.*?)</title>", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.Singleline);
+    private static readonly Regex LinkRegex =
+        new(@"<link>(.*?)</link>", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.Singleline);
+    private static readonly Regex SourceUrlRegex =
+        new(@"<source[^>]*url=""([^""]+)""[^>]*>(.*?)</source>",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.Singleline);
+    private static readonly Regex DescriptionRegex =
+        new(@"<description>(.*?)</description>", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.Singleline);
+
+    private readonly HttpClient _http;
+    private readonly string _edition;
+
+    /// <summary>Creates the engine (owner of its own HttpClient).</summary>
+    public GoogleNewsSearchEngine(TimeSpan? timeout = null, string edition = "en-US")
+    {
+        _http = new HttpClient { Timeout = timeout ?? TimeSpan.FromSeconds(10) };
+        _http.DefaultRequestHeaders.UserAgent.ParseAdd(BrowserUserAgent);
+        _http.DefaultRequestHeaders.AcceptLanguage.ParseAdd("en-US,en;q=0.9");
+        _edition = edition;
+    }
+
+    /// <inheritdoc />
+    public override string Name => "Google";
+
+    /// <inheritdoc />
+    public override IReadOnlyList<WebSearchResult> Fetch(string query, int maxResults)
+    {
+        var url = $"https://news.google.com/rss/search?q={Uri.EscapeDataString(query)}" +
+                  $"&hl={Uri.EscapeDataString(_edition)}&gl=US&ceid=US:en";
+        var html = Get(_http, url);
+        return Parse(html, maxResults);
+    }
+
+    /// <summary>Parses a Google News RSS results page (exposed for offline tests).</summary>
+    public static IReadOnlyList<WebSearchResult> Parse(string html, int maxResults)
+    {
+        var results = new List<WebSearchResult>();
+        foreach (Match item in ItemRegex.Matches(html))
+        {
+            if (results.Count >= maxResults) break;
+            var body = item.Groups[1].Value;
+            var title = RssText(TitleRegex.Match(body).Groups[1].Value);
+            var link = RssText(LinkRegex.Match(body).Groups[1].Value);
+            var source = SourceUrlRegex.Match(body);
+            var publisher = source.Success ? StripTags(source.Groups[2].Value) : "";
+            var description = RssText(DescriptionRegex.Match(body).Groups[1].Value);
+            if (title.Length == 0 || link.Length == 0) continue;
+            // Snippet: the publisher name grounds the hit; the description is
+            // usually a related-articles list, so it only fills in when short.
+            var snippet = publisher.Length > 0
+                ? publisher + (description.Length is > 0 and < 160 ? " — " + description : "")
+                : description;
+            results.Add(new WebSearchResult(title, link, snippet));
+        }
+        return results;
+    }
+
+    private static string RssText(string raw)
+    {
+        var cdata = Regex.Match(raw, @"<!\[CDATA\[(.*?)\]\]>", RegexOptions.Singleline);
+        if (cdata.Success) raw = cdata.Groups[1].Value;
+        return StripTags(raw);
+    }
+}
+
+/// <summary>
+/// Wikipedia search (second engine — the knowledge fallback). Wikipedia's
+/// public API is keyless, never bot-checked, and ideal for an AI that wants
+/// to UNDERSTAND a topic: results arrive as JSON with a clean text snippet
+/// and a stable article URL. For "what is X" style questions this engine is
+/// the most reliable answer on the internet.
+/// </summary>
+public sealed class WikipediaSearchEngine : HttpSearchEngineBase
+{
+    private readonly HttpClient _http;
+    private readonly string _language;
+
+    /// <summary>Creates the engine (owner of its own HttpClient).</summary>
+    public WikipediaSearchEngine(TimeSpan? timeout = null, string language = "en")
+    {
+        _http = new HttpClient { Timeout = timeout ?? TimeSpan.FromSeconds(10) };
+        _http.DefaultRequestHeaders.UserAgent.ParseAdd(BrowserUserAgent);
+        _language = language;
+    }
+
+    /// <inheritdoc />
+    public override string Name => "Wikipedia";
+
+    /// <inheritdoc />
+    public override IReadOnlyList<WebSearchResult> Fetch(string query, int maxResults)
+    {
+        var url = $"https://{_language}.wikipedia.org/w/api.php" +
+                  "?action=query&list=search&format=json&srlimit=" +
+                  Math.Max(maxResults, 5) +
+                  $"&srsearch={Uri.EscapeDataString(query)}";
+        var json = Get(_http, url);
+        return Parse(json, maxResults, _language);
+    }
+
+    /// <summary>Parses a Wikipedia API search response (exposed for offline tests).</summary>
+    public static IReadOnlyList<WebSearchResult> Parse(string json, int maxResults, string language = "en")
+    {
+        var results = new List<WebSearchResult>();
+        using var doc = JsonDocument.Parse(json);
+        if (!doc.RootElement.TryGetProperty("query", out var query) ||
+            !query.TryGetProperty("search", out var hits) ||
+            hits.ValueKind != JsonValueKind.Array)
+            return results;
+
+        foreach (var hit in hits.EnumerateArray())
+        {
+            if (results.Count >= maxResults) break;
+            if (!hit.TryGetProperty("title", out var titleEl)) continue;
+            var title = titleEl.GetString() ?? "";
+            if (title.Length == 0) continue;
+
+            string snippet = "";
+            if (hit.TryGetProperty("snippet", out var snippetEl))
+            {
+                // Snippets carry <span class="searchmatch"> highlights — strip them.
+                snippet = StripTags(snippetEl.GetString() ?? "");
+            }
+            var slug = Uri.EscapeDataString(title.Replace(' ', '_'));
+            var url = $"https://{language}.wikipedia.org/wiki/{slug}";
+            results.Add(new WebSearchResult(title, url, snippet));
+        }
+        return results;
+    }
+}
+
+/// <summary>
+/// Bing web search (third engine — general web when the others cannot
+/// answer). Uses Bing's RSS output (<c>format=rss</c>) — a small, stable
+/// page with direct links; the HTML scrape of b_algo blocks serves
+/// randomized junk to lightweight clients. NOTE: Bing's RSS endpoint is
+/// known to serve locally-personalized junk to datacenter IPs — the
+/// backend's relevance gate catches that and moves on to the next engine.
+/// RSS descriptions are tag-stripped and entity-decoded; /ck/a-style links
+/// are unwrapped defensively.
 /// </summary>
 public sealed class BingSearchEngine : HttpSearchEngineBase
 {
@@ -269,125 +382,43 @@ public sealed class BingSearchEngine : HttpSearchEngineBase
     }
 }
 
-/// <summary>DuckDuckGo "lite" HTML endpoint (GET, no key, second in the chain).</summary>
-public sealed class DuckDuckGoLiteEngine : HttpSearchEngineBase
-{
-    private static readonly Regex LinkRegex =
-        new(@"<a[^>]*class=""result-link""[^>]*href=""([^""]+)""[^>]*>(.*?)</a>",
-            RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.Singleline);
-    private static readonly Regex SnippetRegex =
-        new(@"<td[^>]*class=""result-snippet""[^>]*>(.*?)</td>",
-            RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.Singleline);
-
-    private readonly HttpClient _http;
-
-    /// <summary>Creates the engine (owner of its own HttpClient).</summary>
-    public DuckDuckGoLiteEngine(TimeSpan? timeout = null)
-    {
-        _http = new HttpClient { Timeout = timeout ?? TimeSpan.FromSeconds(10) };
-        _http.DefaultRequestHeaders.UserAgent.ParseAdd(BrowserUserAgent);
-        _http.DefaultRequestHeaders.AcceptLanguage.ParseAdd("en-US,en;q=0.9");
-    }
-
-    /// <inheritdoc />
-    public override string Name => "DuckDuckGo";
-
-    /// <inheritdoc />
-    public override IReadOnlyList<WebSearchResult> Fetch(string query, int maxResults)
-    {
-        var html = Get(_http, "https://lite.duckduckgo.com/lite/?q=" +
-                                 Uri.EscapeDataString(query));
-        return Parse(html, maxResults);
-    }
-
-    /// <summary>Parses a DuckDuckGo lite page (exposed for offline tests).</summary>
-    public static IReadOnlyList<WebSearchResult> Parse(string html, int maxResults)
-    {
-        var titles = new List<(string Url, string Title)>();
-        foreach (Match m in LinkRegex.Matches(html))
-            titles.Add((UnwrapDdgUrl(m.Groups[1].Value), StripTags(m.Groups[2].Value)));
-        var snippets = new List<string>();
-        foreach (Match m in SnippetRegex.Matches(html))
-            snippets.Add(StripTags(m.Groups[1].Value));
-
-        var results = new List<WebSearchResult>();
-        for (int i = 0; i < titles.Count && results.Count < maxResults; i++)
-        {
-            if (titles[i].Title.Length == 0) continue;
-            results.Add(new WebSearchResult(titles[i].Title, titles[i].Url,
-                i < snippets.Count ? snippets[i] : ""));
-        }
-        return results;
-    }
-}
-
-/// <summary>DuckDuckGo full HTML endpoint (POST form; last resort in the chain).</summary>
-public sealed class DuckDuckGoHtmlEngine : HttpSearchEngineBase
-{
-    private static readonly Regex LinkRegex =
-        new(@"<a[^>]*class=""result__a""[^>]*href=""([^""]+)""[^>]*>(.*?)</a>",
-            RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.Singleline);
-    private static readonly Regex SnippetRegex =
-        new(@"<a[^>]*class=""result__snippet""[^>]*>(.*?)</a>",
-            RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.Singleline);
-
-    private readonly HttpClient _http;
-
-    /// <summary>Creates the engine (owner of its own HttpClient).</summary>
-    public DuckDuckGoHtmlEngine(TimeSpan? timeout = null)
-    {
-        _http = new HttpClient { Timeout = timeout ?? TimeSpan.FromSeconds(10) };
-        _http.DefaultRequestHeaders.UserAgent.ParseAdd(BrowserUserAgent);
-        _http.DefaultRequestHeaders.AcceptLanguage.ParseAdd("en-US,en;q=0.9");
-    }
-
-    /// <inheritdoc />
-    public override string Name => "DuckDuckGo-html";
-
-    /// <inheritdoc />
-    public override IReadOnlyList<WebSearchResult> Fetch(string query, int maxResults)
-    {
-        var html = Post(_http, "https://html.duckduckgo.com/html/",
-            new Dictionary<string, string> { ["q"] = query });
-        var titles = new List<(string Url, string Title)>();
-        foreach (Match m in LinkRegex.Matches(html))
-            titles.Add((UnwrapDdgUrl(m.Groups[1].Value), StripTags(m.Groups[2].Value)));
-        var snippets = new List<string>();
-        foreach (Match m in SnippetRegex.Matches(html))
-            snippets.Add(StripTags(m.Groups[1].Value));
-
-        var results = new List<WebSearchResult>();
-        for (int i = 0; i < titles.Count && results.Count < maxResults; i++)
-        {
-            if (titles[i].Title.Length == 0) continue;
-            results.Add(new WebSearchResult(titles[i].Title, titles[i].Url,
-                i < snippets.Count ? snippets[i] : ""));
-        }
-        return results;
-    }
-}
-
 /// <summary>
-/// Real HTTP web search across a chain of engines (Bing first, DuckDuckGo as
-/// fallback). An engine that answers with a bot-check no longer poisons the
-/// whole search: the next engine gets a try. When every engine fails, the
-/// reported reason is honest — "offline" only when the network truly failed.
+/// Real HTTP web search across a chain of engines (Google News first, then
+/// Wikipedia, then Bing — DuckDuckGo was removed by design). Two guards
+/// keep the results honest:
+///
+/// 1. THE RELEVANCE GATE. An engine's output is only accepted when the
+///    results actually MATCH the query: every content word of the query
+///    (3+ letters) must appear in at least one result's title/snippet/host.
+///    This is the fix for "wikipedia flowers" returning nothing but
+///    Wikipedia-site pages (the word "flowers" silently vanished) and for
+///    Bing's datacenter junk ("flowers" answering with pizza restaurants) —
+///    an engine that misses part of the question is skipped, the next one
+///    gets a try.
+/// 2. THE TOPIC RETRY. When every engine missed part of the query, the
+///    search retries once with the query's substantial topic words only
+///    (short function words and site-name noise dropped), so a clunky
+///    query still finds its subject.
+///
+/// When every engine fails, the reported reason is honest — "offline" only
+/// when the network truly failed.
 /// </summary>
 public sealed class HttpWebSearchBackend : IWebSearchBackend
 {
     private readonly IReadOnlyList<IWebSearchEngine> _engines;
     private readonly int _attempts;
 
-    /// <summary>Creates the backend with the default engine chain (Bing → DDG lite → DDG html).</summary>
+    /// <summary>Creates the backend with the default engine chain
+    /// (Google → Wikipedia → Bing).</summary>
     public HttpWebSearchBackend(TimeSpan? timeout = null, int attempts = 1,
         IReadOnlyList<IWebSearchEngine>? engines = null)
     {
         _attempts = Math.Max(1, attempts);
         _engines = engines ?? new IWebSearchEngine[]
         {
+            new GoogleNewsSearchEngine(timeout),
+            new WikipediaSearchEngine(timeout),
             new BingSearchEngine(timeout),
-            new DuckDuckGoLiteEngine(timeout),
-            new DuckDuckGoHtmlEngine(timeout),
         };
     }
 
@@ -403,6 +434,47 @@ public sealed class HttpWebSearchBackend : IWebSearchBackend
         bool sawResponse = false;   // at least one engine answered at HTTP level
         bool sawBlocked = false;    // at least one bot-check
         string detail = "no results";
+        IReadOnlyList<WebSearchResult>? bestEffort = null;
+
+        var run = RunOnce;
+        var words = ContentWords(query);
+        var (results, why) = run(query, maxResults, words);
+        Collect(results, why);
+
+        if (bestEffort is null && words.Count > 1)
+        {
+            // Topic retry: keep the query's substantial words only.
+            var topic = string.Join(' ', words.OrderByDescending(w => w.Length).Take(3));
+            if (!string.Equals(topic, query.Trim(), StringComparison.OrdinalIgnoreCase))
+            {
+                (results, why) = run(topic, maxResults, ContentWords(topic));
+                Collect(results, why);
+            }
+        }
+
+        if (bestEffort is not null)
+            return bestEffort;
+
+        var reason = sawBlocked ? WebSearchFailure.Blocked
+                   : sawResponse ? WebSearchFailure.NoResults
+                   : WebSearchFailure.Offline;
+        throw new WebSearchException($"web search could not complete ({detail})", reason);
+
+        // ---- local helpers -------------------------------------------------
+        void Collect(IReadOnlyList<WebSearchResult>? rs, string whyLocal)
+        {
+            if (rs is not null && rs.Count > 0 && bestEffort is null)
+                bestEffort = rs;
+            if (whyLocal.Length > 0) detail = whyLocal;
+        }
+    }
+
+    private (IReadOnlyList<WebSearchResult>?, string) RunOnce(
+        string query, int maxResults, IReadOnlyList<string> words)
+    {
+        bool sawResponse = false, sawBlocked = false;
+        string detail = "no results";
+        IReadOnlyList<WebSearchResult>? best = null;
 
         for (int attempt = 0; attempt < _attempts; attempt++)
         {
@@ -411,9 +483,17 @@ public sealed class HttpWebSearchBackend : IWebSearchBackend
                 try
                 {
                     var results = engine.Fetch(query, maxResults);
-                    if (results.Count > 0) return results;
+                    if (results.Count == 0)
+                    {
+                        sawResponse = true;
+                        detail = $"{engine.Name} returned a page with no readable results";
+                        continue;
+                    }
                     sawResponse = true;
-                    detail = $"{engine.Name} returned a page with no readable results";
+                    best ??= results; // keep as last-resort output
+                    if (IsRelevant(words, results))
+                        return (results, "");
+                    detail = $"{engine.Name} results did not match the full query";
                 }
                 catch (WebSearchException ex)
                 {
@@ -436,19 +516,60 @@ public sealed class HttpWebSearchBackend : IWebSearchBackend
             }
         }
 
-        var reason = sawBlocked ? WebSearchFailure.Blocked
-                   : sawResponse ? WebSearchFailure.NoResults
-                   : WebSearchFailure.Offline;
-        throw new WebSearchException($"web search could not complete ({detail})", reason);
+        if (sawBlocked) detail = detail.Length > 0 ? detail : "blocked";
+        return (null, detail);
+    }
+
+    /// <summary>
+    /// The relevance gate: every content word of the query (3+ letters,
+    /// stop-words removed) must show up in at least one result's
+    /// title/snippet/host. A query like "wikipedia flowers" answered only
+    /// with Wikipedia-site pages fails the "flowers" half and is rejected.
+    /// Queries with no content words always pass.
+    /// </summary>
+    internal static bool IsRelevant(IReadOnlyList<string> contentWords,
+        IReadOnlyList<WebSearchResult> results)
+    {
+        if (contentWords.Count == 0) return true;
+        var haystacks = results.Select(r =>
+            $"{r.Title} {r.Snippet} {SafeHost(r.Url)}").ToList();
+        foreach (var word in contentWords)
+            if (!haystacks.Any(h => h.Contains(word, StringComparison.OrdinalIgnoreCase)))
+                return false;
+        return true;
+    }
+
+    /// <summary>Query's content words: 3+ letters, stop-words removed, deduped.</summary>
+    internal static IReadOnlyList<string> ContentWords(string query) =>
+        Regex.Matches(query.ToLowerInvariant(), @"[a-z0-9']{3,}")
+             .Select(m => m.Value)
+             .Where(w => !StopWords.Contains(w))
+             .Distinct()
+             .ToList();
+
+    private static readonly HashSet<string> StopWords = new()
+    {
+        "the", "and", "for", "with", "that", "this", "what", "who", "when",
+        "where", "why", "how", "are", "was", "were", "you", "your", "about",
+        "any", "can", "could", "does", "did", "from", "have", "has", "into",
+        "look", "please", "search", "find", "tell", "give", "some", "info",
+        "information", "she", "her", "his", "him", "its", "our", "out",
+        "get", "got", "all", "not", "but", "just", "like", "want", "need"
+    };
+
+    private static string SafeHost(string url)
+    {
+        try { return new Uri(url).Host; }
+        catch (UriFormatException) { return ""; }
     }
 }
 
 /// <summary>
 /// The web-search tool. MANUAL-ONLY by design: it carries no trigger phrases
 /// and <see cref="ManualOnly"/> keeps it out of auto-invocation, so the mind
-/// never goes online unprompted — a user (or program) must explicitly ask
-/// for it. This is the guard the conversation asked for: "she is able to
-/// complete it and not do it whenever she feels like it".
+/// never goes online unprompted unless <c>Tools.AutoFetchWeb</c> turned the
+/// knowledge-gap auto-lookup on (a separate, explicit builder decision).
+/// A user (or program) must normally explicitly ask for it.
 /// </summary>
 public sealed class WebSearchTool : ITool
 {
@@ -470,7 +591,7 @@ public sealed class WebSearchTool : ITool
 
     /// <inheritdoc />
     public IReadOnlyDictionary<string, string> Parameters =>
-        new Dictionary<string, string> { ["query"] = "what to search the web for" };
+        new Dictionary<string, string> { ["query"] = "what to search the web for", ["focus"] = "optional suggestion — which results matter most" };
 
     /// <inheritdoc />
     public IReadOnlyList<string> Triggers => Array.Empty<string>();
@@ -485,8 +606,11 @@ public sealed class WebSearchTool : ITool
             ? q
             : invocation.RawInput;
         query = query?.Trim().TrimEnd('?', '!', '.') ?? "";
+        var focus = invocation.Arguments.TryGetValue("focus", out var f) && !string.IsNullOrWhiteSpace(f)
+            ? f.Trim()
+            : null;
         if (query.Length == 0)
-            return ToolResult.Fail("No search query given. Usage: /searchweb <what to look up>.");
+            return ToolResult.Fail("No search query given. Usage: /searchweb \"<what to look up>\" [suggestion].");
 
         try
         {
@@ -494,9 +618,15 @@ public sealed class WebSearchTool : ITool
             if (results.Count == 0)
                 return ToolResult.Fail($"Nothing readable came back from the web for \"{query}\".");
 
+            // The suggestion argument steers the report: hits matching the
+            // focus words come first, so what the user asked FOR leads.
+            if (!string.IsNullOrWhiteSpace(focus))
+                results = RankByFocus(results, focus);
+
             var lines = new List<string>
             {
-                $"Here is what I found on the web for \"{query}\":"
+                $"Here is what I found on the web for \"{query}\"" +
+                (focus is not null ? $" (focusing on: {Mind.Truncate(focus, 60)})" : "") + ":"
             };
             for (int i = 0; i < results.Count; i++)
             {
@@ -511,6 +641,7 @@ public sealed class WebSearchTool : ITool
                 new Dictionary<string, object>
                 {
                     ["query"] = query,
+                    ["focus"] = focus ?? "",
                     ["results"] = results,
                 });
         }
@@ -527,6 +658,25 @@ public sealed class WebSearchTool : ITool
             };
             return ToolResult.Fail($"I could not search the web for \"{query}\": {ex.Message}. {advice}");
         }
+    }
+
+    /// <summary>
+    /// Re-ranks results by the focus suggestion: hits whose title/snippet
+    /// mention more of the focus's content words come first. Stable — equal
+    /// scores keep their engine order. No focus (or no content words) leaves
+    /// the order untouched.
+    /// </summary>
+    internal static IReadOnlyList<WebSearchResult> RankByFocus(
+        IReadOnlyList<WebSearchResult> results, string? focus)
+    {
+        var words = HttpWebSearchBackend.ContentWords(focus ?? "");
+        if (words.Count == 0 || results.Count <= 1) return results;
+        return results
+            .Select((r, i) => (r, i, score: words.Count(w =>
+                $"{r.Title} {r.Snippet}".Contains(w, StringComparison.OrdinalIgnoreCase))))
+            .OrderByDescending(x => x.score).ThenBy(x => x.i)
+            .Select(x => x.r)
+            .ToList();
     }
 
     private static string SafeHost(string url)

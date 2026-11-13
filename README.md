@@ -1,5 +1,3 @@
-## This library was made using GLM-5.3-flash, You may use it, study and fork it as long as the project keeps the MIT License
-
 # Cognify
 
 **A cognitive architecture library for .NET 8** — build AI models that can *reason, think, learn by themselves, feel emotions, remember, pursue goals, have a personality* — and that can also **see, hear, understand languages, embed meaning, use tools, write and analyze code, and generate media**.
@@ -469,37 +467,14 @@ The `web-search` tool gives the mind the internet, with a hard guard: **it is ma
 
 ```csharp
 var mind = MindBuilder.Create("Yume")
-    .WithWebSearch()                       // registers web-search (multi-engine HTTP chain)
+    .WithWebSearch()                       // registers web-search (DuckDuckGo HTTP backend)
     .Build();
 var result = mind.SearchWeb("what is a quokka");   // the ONLY way she touches the internet
 ```
 
 When the search succeeds she LEARNS from it: snippets become recallable long-term memories, clean "X is Y" sentences become knowledge-base facts (source "web"), the text feeds the next-token model, and the query's words count as known — she looked them up instead of asking what they mean. When it fails (offline, blocked, engine layout change), she says so cleanly: "I could not search the web for ...: web search could not complete (...). Web search needs an internet connection — try again, or teach me directly." The search retries once and enforces a timeout, so a flaky network turns into a message instead of a hang. Plug in your own backend (Bing, SerpAPI, a local index) via `Tools.WebSearchBackend = myIWebSearchBackend`.
 
-### Web exploration — she reads INTO the pages
-A search result is only a doorway: a snippet is 140 characters, and a brand-dominated SERP ("wikipedia flowers") can push the actual topic right out of view. So after a successful search she **opens the most query-relevant result and reads the page itself** (`Cognify.Tools.WebExplorer`) — scripts, styles and site chrome stripped, thousands of characters of readable text — and learns from what she read: memories, knowledge-base facts, both language models. If the first page turns out not to mention the topic at all, the next best result gets its chance; and when the page she lands on is a site's front door, she may **follow the in-page link that matches the query best** — the front door becomes the actual article. The chat report tells you exactly what she read:
-
-```
-Here is what I found on the web for "flowers":
- 1. ... (www.ftd.com)
- ...
-I also read into the most relevant page to learn more:
- • Flower - Wikipedia (en.wikipedia.org)
-   A flower is the reproductive structure of flowering plants...
-```
-
-Reading one page further is part of the same consent — the user asked for the lookup, the page IS the lookup. It stays bounded (`WebExplorationOptions`), it never fires on its own, and you can shape it fluently:
-
-```csharp
-.WithWebSearch(t => t.Exploration(e => e.Explore(true)    // dig into results (default on)
-                                     .Follow(true)        // follow a better in-page link (default on)
-                                     .Pages(2)            // max pages per exploration (1..4)
-                                     .Budget(4000)))      // readable-text budget per page
-```
-
-For "go read THAT site", there is a second manual-only tool: `mind.ExploreWeb(url)` opens any page directly (scheme-less addresses get `https://` for free), reads it, and learns the same way. Swap the fetcher (fixtures in tests, a caching proxy) via `Tools.WebPageFetcher = myIWebPageFetcher`; both the exploration settings and the fetcher ride along in the persisted config.
-
-The demo exposes both as `/searchweb <query>` and `/explore <url>` slash commands — see below.
+The demo exposes it as the `/searchweb <query>` slash command — see below.
 
 ### Taught arithmetic — reasoning instead of a calculator
 The mind learns arithmetic the way a child does: from what it is **taught**, and it reasons with that knowledge. The calculator is a crutch it does not need for anything you taught it — it only steps in when reasoning comes up empty (or when you explicitly ask for it).
@@ -604,9 +579,7 @@ dotnet run --project demo/Cognify.Yume -- --train corpus/words-and-meanings.txt 
 #   /teach <sentence>                   # teach facts line-by-line
 #   /train <file>                       # bulk-train a corpus file
 #   /searchweb <query>                  # EXPLICIT web search — she only goes
-#                                       # online when YOU type this, never on her own;
-#                                       # she then READS INTO the best result page
-#   /explore <url>                      # open any web page and read it (manual-only)
+#                                       # online when YOU type this, never on her own
 #   /improve                            # run a self-improvement review pass
 #   /predict <text>                     # her next-token predictions after your
 #                                       # words (hybrid: n-gram + transformer)
@@ -719,17 +692,28 @@ Export a trained mind into standard ML interchange formats with `Cognify.Export.
 using Cognify.Export;
 
 var files = MindExporter.ExportBundle(mind, "export/yume");
-// yume.gguf, yume.safetensors, tokenizer/tokenizer.json, train_config.json,
-// finetune.sh, quantize.sh, training_data.txt, val_data.txt, config.json, README.md
+// yume.gguf, yume-llamacpp.gguf, yume.safetensors, tokenizer/tokenizer.json,
+// train_config.json, finetune.sh, quantize.sh, training_data.txt,
+// val_data.txt, config.json, README.md
 ```
 
 Individual exports are available too:
 
 ```csharp
-MindExporter.ExportGguf(mind, "yume.gguf");                 // GGUF v3 container
+MindExporter.ExportGguf(mind, "yume.gguf");                 // GGUF v3 archive (cognify architecture)
+MindExporter.ExportGgufForLlamaCpp(mind, "yume-llamacpp.gguf"); // RUNNABLE gpt2 GGUF
 MindExporter.ExportSafetensors(mind, "yume.safetensors");   // Hugging Face tensors
 MindExporter.ExportTokenizer(mind, "tokenizer/");           // HF WordPiece tokenizer
 ```
+
+**The llama.cpp-runnable GGUF** — `ExportGgufForLlamaCpp` (also written by `ExportBundle` when her transformer is trained, and by the demo's `/export` command) maps her neural language model onto the **stock `gpt2` architecture**, so llama.cpp / llama-cpp-python / Unsloth can load it, tokenize with the bundled word-level tokenizer and generate:
+
+* exact llama.cpp tensor names — `token_embd.weight`, `position_embd.weight`, `blk.N.attn_norm`, `blk.N.attn_qkv` (the separate Q/K/V projections fused exactly as GPT-2's `c_attn`), `blk.N.attn_output`, `blk.N.ffn_up`, `blk.N.ffn_down`, `output_norm`; the output head is weight-tied (omitted, matching how she trains).
+* the full `tokenizer.ggml` set — tokens in GPT-2 byte-unicode form (Ġ for spaces), per-token types (i32), special-token ids and BPE merges that re-assemble every vocabulary word from its characters, so prompt encoding reaches the word ids she was trained with.
+* every GGUF the library writes is validated by `GgufReader` in the test suite and by the official `gguf-py` reader — tensor offsets are relative to the data section (the spec), ne[0] is the fastest-varying dimension, and `tokenizer.ggml.token_type` is written as the i32 array llama.cpp requires.
+* honest caveats: the FFN activation is the tanh GELU approximation while llama.cpp evaluates exact GELU (a sub-0.003 delta per activation); out-of-vocabulary prompt words fall back to `<unk>`. The archive `{name}.gguf` keeps the custom `cognify` architecture — spec-compliant (gguf-py / llama-quantize read it fine) but not runnable by llama.cpp, which has no graph for it.
+* every GGUF is **self-verified after writing**: the exporter re-reads the file, compares every tensor payload value-for-value and runs the gpt2 loader conformance lint (hyperparameters, tensor names and shapes, tokenizer metadata). A broken export fails at export time, not inside llama.cpp.
+* **when a GGUF refuses to load** with "tensor layout does not match this build's quantization types", the file contains quant types newer than the installed build (e.g. dynamic quants from a publisher fork such as Unsloth, or MXFP4) — pick another quant, or use the llama.cpp build the model card names; re-quantizing an F32 source with `llama-quantize` always yields universally loadable weights. Diagnose any file FIRST with `GgufDiagnostics.Inspect(path)` (in `Cognify.Export`): it parses any GGUF v2/v3 — including files written by other tools — and reports which tensor quantization types it actually contains against llama.cpp's ggml type table (F32 … MXFP4, NVFP4, …), plus a plain verdict and next steps.
 
 **Sharded safetensors checkpoints** — split the weights with the standard Hugging Face checkpoint naming (`model-00001-of-00062.safetensors`):
 
@@ -749,6 +733,7 @@ What each format carries:
 | File | Contents |
 |------|----------|
 | `*.gguf` | **Spec-compliant GGUF v3**: llama.cpp-style metadata (`general.architecture`, `general.name`, personality traits, net dims, training stats) + F32 tensors `cognify.net.w1/b1/w2/b2` + RL `cognify.rl.q_values/q_counts` +, once the neural language model is trained, the transformer's `cognify.transformer.*` tensors (embeddings, attention projections, LayerNorms, FFN weights), all 32-byte aligned. Inspect with `gguf-dump`, requantize with `llama-quantize`. |
+| `*-llamacpp.gguf` | **Runnable** `gpt2`-architecture GGUF of her trained transformer (see above) — this is the file for llama.cpp / Unsloth / llama-cpp-python. |
 | `*.safetensors` | The same tensors in the Hugging Face format (padded JSON header, contiguous offsets, `__metadata__`). Load with `safetensors.numpy.load_file`. |
 | `tokenizer/tokenizer.json` | HF WordPiece tokenizer built from the mind's **own corpus** (facts + memories), with `[PAD] [UNK] [BOS] [EOS] [MASK]` specials; loads via `tokenizers.Tokenizer.from_file`. Plus `vocab.json` and `special_tokens_map.json`. |
 | `train_config.json` | llama.cpp finetune-style hyperparameters (context, batch, lr, epochs, Adam, LoRA, quantization plan). |
@@ -757,7 +742,7 @@ What each format carries:
 
 Tune the bundle with `ExportOptions` (model name, vocab size, quantization type, context/batch/epochs/lr/threads). Tune the mind itself via `MindBuilder` before exporting.
 
-> **Honest scope note**: a Cognify mind is a cognitive architecture (micro-net + deep nets + a tiny internal transformer + reinforcement learning + knowledge graph), not an LLM-scale model. The GGUF/safetensors payloads are real, spec-compliant files containing the mind's learned weights and metadata — usable as training artifacts, LoRA seeds, weight snapshots or archives — but llama.cpp's shipped LLM graphs cannot run a Cognify mind directly.
+> **Honest scope note**: a Cognify mind is a cognitive architecture (micro-net + deep nets + a tiny internal transformer + reinforcement learning + knowledge graph), not an LLM-scale model. The GGUF/safetensors payloads are real, spec-compliant files containing the mind's learned weights and metadata — usable as training artifacts, LoRA seeds, weight snapshots or archives. The archive GGUF's custom `cognify` architecture cannot be run by llama.cpp's shipped LLM graphs — but **`{name}-llamacpp.gguf` can**: it is a stock `gpt2` GGUF of her trained transformer, loadable and generatable with llama.cpp, llama-cpp-python and Unsloth (verified end-to-end).
 
 ## Events — react to the mind's life
 

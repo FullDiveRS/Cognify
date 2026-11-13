@@ -32,18 +32,12 @@ public class WebSearchTests
         }
     }
 
-    private static Mind BuildMind(FakeBackend backend, bool exploration = false) =>
+    private static Mind BuildMind(FakeBackend backend) =>
         MindBuilder.Create("Curious")
             .WithReasoning()
             .WithSelfLearning()
             .WithMemory()
-            .WithWebSearch(t =>
-            {
-                t.WebSearchBackend = backend;
-                // Exploration (reading INTO result pages) gets its own offline
-                // test file — here we test the search half without a network.
-                t.Exploration(e => e.Explore(exploration));
-            })
+            .WithWebSearch(t => t.WebSearchBackend = backend)
             .Build();
 
     [Fact]

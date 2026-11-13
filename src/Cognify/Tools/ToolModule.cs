@@ -1,5 +1,6 @@
 using Cognify.Core;
 using Cognify.Reasoning;
+using Cognify.Thinking;
 
 namespace Cognify.Tools;
 
@@ -167,6 +168,82 @@ public sealed class ToolModule : CognitiveModuleBase
                     0.7, 850, "tool-use");
             }
         }
+
+        // 5. AUTONOMOUS WEB LOOKUP — her own WebFetch (WithAutoWebFetch).
+        //    When the conversation landed on a topic that is clearly OUTSIDE
+        //    her knowledge — nothing recalled, no taught answer — she says so
+        //    naturally, looks it up herself, learns from the results and
+        //    answers from what she found. Still guarded: arithmetic, identity
+        //    /personal talk and smalltalk never trigger it, one lookup per
+        //    unfamiliar topic, and a failed lookup stays silent (the normal
+        //    honest "teach me" reply runs instead).
+        if (_options.AutoFetchWeb && context.Response is null)
+            TryKnowledgeGapLookup(context, text, mathAnswered || mathAttempted);
+    }
+
+    // Topics the auto-lookup already tried this session — one lookup per
+    // unfamiliar topic, success or fail (session-scoped by design; the mind
+    // may retry after a restart, which mirrors how a person might too).
+    private readonly HashSet<string> _autoLookupTopics = new(StringComparer.OrdinalIgnoreCase);
+
+    private void TryKnowledgeGapLookup(CognitiveContext context, string text, bool isMath)
+    {
+        if (isMath) return;
+        if (context.Reasoning?.Answer is not null) return;   // she knows the answer
+        if (context.Bag.ContainsKey("tools.invoked")) return; // a tool already handled it
+        if (Host is null) return;
+
+        var topic = ResponseComposer.TopicOf(text);
+        if (topic.Length == 0 || topic == "that" || topic.Length < 3) return;
+
+        // Memory has ground ONLY when a recalled memory actually mentions
+        // the topic — loosely related chatter about other things is not
+        // knowledge ("hey Yume, what is a quokka?" must still look it up).
+        // The mind's own conversation bookkeeping (topic-shift notes) does
+        // not count: it MENTIONS the topic without knowing anything of it.
+        if (context.Recalled.Any(m =>
+                m.Source != "conversation" &&
+                m.Content.Contains(topic, StringComparison.OrdinalIgnoreCase))) return;
+
+        // Personal / identity / smalltalk never goes to the web.
+        var lowered = $" {text.ToLowerInvariant()} ";
+        foreach (var word in new[] { " you ", " your ", " yourself ", " u " })
+            if (lowered.Contains(word)) return;
+        if (ResponseComposer.MentionsUnknownPerson(text)) return;
+
+        if (!_autoLookupTopics.Add(topic)) return;           // one lookup per topic
+
+        var result = Host.SearchWeb(topic);
+        if (!result.Success)
+        {
+            // Failed lookup stays SILENT: no hijacked reply — the normal
+            // honest "teach me" composition runs unchanged.
+            Host.Stream?.Add("web", $"wanted to look up '{topic}' but the search did not complete");
+            _autoLookupTopics.Remove(topic); // silence must not burn the topic forever
+            return;
+        }
+
+        // Summarize the top hits into a natural first-person reply.
+        var summary = new List<string>();
+        if (result.Data.TryGetValue("results", out var raw) &&
+            raw is IReadOnlyList<WebSearchResult> hits)
+        {
+            foreach (var hit in hits.Take(2))
+            {
+                var host = "";
+                try { host = new Uri(hit.Url).Host; } catch (UriFormatException) { }
+                var snippet = string.IsNullOrWhiteSpace(hit.Snippet) ? "" : $" — {Core.Mind.Truncate(hit.Snippet, 120)}";
+                summary.Add($"\"{hit.Title}\"{snippet}" + (host.Length > 0 ? $" ({host})" : ""));
+            }
+        }
+        string body = summary.Count > 0
+            ? string.Join("; ", summary)
+            : Core.Mind.Truncate(result.Output, 220);
+        context.Response = new ResponseDraft(
+            $"I don't know much about {topic} yet, so I searched the web to understand it a bit more. " +
+            $"Here is what I found: {body}",
+            0.65, 852, "auto-web-lookup");
+        context.Bag["tools.autoLookup"] = topic;
     }
 
     /// <summary>When the calculator fills in for missing arithmetic knowledge,

@@ -25,7 +25,10 @@ public static class LlamaCppConfigWriter
         var written = new List<string>();
         var jsonOptions = new JsonSerializerOptions { WriteIndented = true };
 
-        string modelGguf = $"{modelName}.gguf";
+        // llama.cpp can only load/run the gpt2-architecture export — NOT the
+        // 'cognify' archive GGUF. Finetuning and quantization must therefore
+        // target the *-llamacpp.gguf file from the bundle.
+        string modelGguf = $"{modelName}-llamacpp.gguf";
         string loraOut = $"{modelName}-lora.gguf";
         string quantized = $"{modelName}.{options.QuantizationType}.gguf";
 
@@ -70,6 +73,10 @@ public static class LlamaCppConfigWriter
         written.Add(configPath);
 
         // ---- finetune.sh --------------------------------------------------
+        // NOTE: this is a VERBATIM interpolated string — write ONE backslash
+        // per line continuation. A doubled \\ here ends up in the script
+        // literally, where bash reads it as an escaped backslash instead of a
+        // continuation, and every line of the llama-finetune call breaks.
         string finetune = $@"#!/usr/bin/env bash
 # Fine-tune the exported {modelName} weights with llama.cpp (LoRA adapter).
 # Prereq: llama.cpp built from source (https://github.com/ggml-org/llama.cpp).
@@ -80,22 +87,22 @@ TRAIN_DATA=""training_data.txt""
 VAL_DATA=""val_data.txt""
 LORA_OUT=""{loraOut}""
 
-./llama-finetune \\
-  --model ""$MODEL"" \\
-  --train-data ""$TRAIN_DATA"" \\
-  --val-data ""$VAL_DATA"" \\
-  --lora-out ""$LORA_OUT"" \\
-  --save-every {options.SaveEvery} \\
-  --threads {options.Threads} \\
-  --ctx {options.ContextLength} \\
-  --batch {options.BatchSize} \\
-  --lr {options.LearningRate.ToString(System.Globalization.CultureInfo.InvariantCulture)} \\
-  --epochs {options.Epochs} \\
-  --use-adam \\
+./llama-finetune \
+  --model ""$MODEL"" \
+  --train-data ""$TRAIN_DATA"" \
+  --val-data ""$VAL_DATA"" \
+  --lora-out ""$LORA_OUT"" \
+  --save-every {options.SaveEvery} \
+  --threads {options.Threads} \
+  --ctx {options.ContextLength} \
+  --batch {options.BatchSize} \
+  --lr {options.LearningRate.ToString(System.Globalization.CultureInfo.InvariantCulture)} \
+  --epochs {options.Epochs} \
+  --use-adam \
   --warmup-batches 20
 
 echo ""LoRA adapter written to $LORA_OUT""
-echo ""Merge it into the base model with: llama-gguf --merge or keep it as an adapter.""
+echo ""Apply it at generation time with: llama-cli --model $MODEL --lora $LORA_OUT""
 ";
         string finetunePath = Path.Combine(directory, "finetune.sh");
         File.WriteAllText(finetunePath, finetune, new UTF8Encoding(false));
@@ -103,7 +110,7 @@ echo ""Merge it into the base model with: llama-gguf --merge or keep it as an ad
 
         // ---- quantize.sh --------------------------------------------------
         string quantize = $@"#!/usr/bin/env bash
-# Quantize {modelGguf} (F32) with llama.cpp.
+# Quantize {modelGguf} (the llama.cpp-runnable gpt2 export, all F32).
 set -euo pipefail
 
 SRC=""{modelGguf}""

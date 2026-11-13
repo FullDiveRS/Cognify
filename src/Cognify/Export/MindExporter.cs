@@ -185,12 +185,30 @@ public static class MindExporter
         return w;
     }
 
-    /// <summary>Exports the mind as a GGUF v3 file.</summary>
+    /// <summary>Exports the mind as a GGUF v3 file. The written file is
+    /// re-read and verified (spec structure, alignment, data in range) before
+    /// this method returns — a corrupt export fails here, not inside gguf
+    /// tooling later.</summary>
     public static void ExportGguf(Mind mind, string path, ExportOptions? options = null)
     {
         options ??= new ExportOptions();
-        BuildGguf(mind, options).Write(path);
+        string fullPath = Path.GetFullPath(path);
+        BuildGguf(mind, options).Write(fullPath);
+        var report = GgufDiagnostics.Inspect(fullPath);
+        if (!report.SpecValid)
+            throw new InvalidOperationException(
+                "export self-check failed: the produced GGUF is not spec-valid — " + report.Render());
     }
+
+    /// <summary>
+    /// Exports the mind's TRAINED neural language model as a llama.cpp-runnable
+    /// <c>gpt2</c>-architecture GGUF (see <see cref="LlamaCppGgufExporter"/>).
+    /// This is the file to hand to llama.cpp, Unsloth, or any GGUF runner —
+    /// unlike the archive <see cref="ExportGguf"/> output (custom
+    /// <c>cognify</c> architecture), a gpt2 GGUF loads and generates.
+    /// </summary>
+    public static LlamaCppGgufResult ExportGgufForLlamaCpp(Mind mind, string path, ExportOptions? options = null)
+        => LlamaCppGgufExporter.Export(mind, path, options);
 
     /// <summary>
     /// Exports the mind's tensors as a single Hugging Face safetensors file.
@@ -244,8 +262,10 @@ public static class MindExporter
         if (splitAmount <= 1)
         {
             // Unsplit: write exactly the file that was asked for, no index.
+            // "pt" is the Hugging Face convention transformers/Unsloth expect;
+            // nonstandard values trigger warnings in strict loaders.
             var writer = new SafetensorsWriter();
-            writer.AddMetadata("format", "cognify-mind");
+            writer.AddMetadata("format", "pt");
             writer.AddMetadata("name", mind.Name);
             foreach (var tensor in tensors) writer.AddTensor(tensor);
             writer.Write(fullPath);
@@ -261,7 +281,7 @@ public static class MindExporter
             {
                 string shardName = SafetensorsSharding.ShardFileName(baseName, s, written);
                 var writer = new SafetensorsWriter();
-                writer.AddMetadata("format", "cognify-mind");
+                writer.AddMetadata("format", "pt");   // HF convention (see unsplit branch)
                 writer.AddMetadata("name", mind.Name);
                 foreach (var tensor in shards[s]) writer.AddTensor(tensor);
                 writer.Write(Path.Combine(directory, shardName));
@@ -305,10 +325,23 @@ public static class MindExporter
         string name = Sanitize(options.ModelName ?? mind.Name);
         var produced = new List<string>();
 
-        // 1. GGUF model.
+        // 1. GGUF archive (custom cognify architecture — inspection/requantize).
         string ggufPath = Path.Combine(directory, $"{name}.gguf");
         ExportGguf(mind, ggufPath, options);
         produced.Add($"{name}.gguf");
+
+        // 1b. llama.cpp-runnable gpt2 GGUF (loads in llama.cpp / Unsloth).
+        string llamacppGgufPath = Path.Combine(directory, $"{name}-llamacpp.gguf");
+        try
+        {
+            LlamaCppGgufExporter.Export(mind, llamacppGgufPath, options);
+            produced.Add($"{name}-llamacpp.gguf");
+        }
+        catch (InvalidOperationException)
+        {
+            // Transformer not trained yet — the bundle ships without the
+            // runnable file rather than failing the whole export.
+        }
 
         // 2. safetensors weights (optionally split HF-style across shards).
         var st = ExportSafetensors(mind, Path.Combine(directory, $"{name}.safetensors"),
@@ -364,7 +397,8 @@ This bundle was produced by Cognify.MindExporter from a live cognitive mind.
 
 | File | Purpose |
 |------|---------|
-| `{name}.gguf` | GGUF v3 container: mind metadata + MicroNet weights + RL Q-table (F32, aligned). Inspect: `gguf-dump {name}.gguf` |
+| `{name}.gguf` | GGUF v3 archive: mind metadata + MicroNet weights + RL Q-table (F32, aligned). Inspect: `gguf-dump {name}.gguf` |
+| `{name}-llamacpp.gguf` | llama.cpp-RUNNABLE gpt2 GGUF of the trained neural language model — load in llama.cpp, Unsloth, llama-cpp-python |
 {stRow}
 | `tokenizer/tokenizer.json` | Hugging Face WordPiece tokenizer built from the mind's corpus ({vocabSize} entries) |
 | `tokenizer/vocab.json` | Plain word→id vocabulary |
@@ -377,13 +411,31 @@ This bundle was produced by Cognify.MindExporter from a live cognitive mind.
 
 ## Usage notes
 
-- The GGUF file is spec-compliant and readable by the llama.cpp tooling ecosystem
-  (gguf-py, llama-quantize). Cognify minds are cognitive architectures rather than
-  LLM transformers, so the GGML graphs that llama.cpp ships cannot run the model
-  directly; treat these files as training/initialization/archival artifacts, e.g.
-  as LoRA training seeds with `finetune.sh`, or as weight snapshots.
+- `{name}-llamacpp.gguf` is a standard gpt2-architecture GGUF: llama.cpp (any
+  recent build), llama-cpp-python and Unsloth can load it, tokenize with the
+  bundled word-level tokenizer and generate. The FFN uses the tanh GELU
+  approximation while llama.cpp evaluates exact GELU (a sub-0.003 delta per
+  activation); out-of-vocabulary words fall back to `<unk>`.
+- `{name}.gguf` is the archive file (custom `cognify` architecture with the
+  micro-net and RL Q-table). It is spec-compliant and readable by the gguf
+  tooling ecosystem (gguf-py, llama-quantize), but llama.cpp has no graph for
+  the `cognify` architecture — treat it as a training/initialization/archive
+  artifact (e.g. a LoRA training seed with `finetune.sh`).
 - Quantization: run `./quantize.sh` after building llama.cpp. Q4_K_M is the usual
-  quality/size trade-off; Q8_0 is near-lossless.
+  quality/size trade-off; Q8_0 is near-lossless. These stock quant types load in
+  any llama.cpp build that supports K-quants (2023+).
+- Every GGUF this bundle shipped was re-read and verified after writing (spec
+  structure, alignment, payload round-trip, and for `{name}-llamacpp.gguf` the
+  full gpt2 loader conformance: hyperparameters, tensor names and shapes,
+  tokenizer metadata).
+- If a GGUF ever fails to load with ""tensor layout does not match this build's
+  quantization types"", the file contains quant types newer than the installed
+  build (e.g. dynamic quants from a publisher fork such as Unsloth, or MXFP4):
+  pick another quant, or use the llama.cpp build the model card names.
+  Re-quantizing an F32 source with `llama-quantize` always yields universally
+  loadable weights. Cognify's `GgufDiagnostics.Inspect(path)` (and
+  `python -m cognify.export.diagnostics <file.gguf>` on the CognifyPy side)
+  reports exactly which quant types a file contains before you load it.
 ";
         string readmePath = Path.Combine(directory, "README.md");
         File.WriteAllText(readmePath, readme);

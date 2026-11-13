@@ -157,6 +157,13 @@ internal sealed class ResponseComposer
                     $"That is beyond what I know so far; teach me about {topic} and I will connect the dots.",
                     $"My knowledge has a {topic}-shaped hole in it - care to fill it?");
         }
+        // Conversational rate: a talkative mind (WithConversational(c =>
+        // c.rate(1.5+))) carries the topic FURTHER — one extra sentence at
+        // rate 1.5, two at 2.0+, drawn from related knowledge, other
+        // memories and her own sayings. Declarative only (never a question
+        // — follow-ups stay under the Expression flag). Concise and trained
+        // styles keep their own shape.
+        body = ExtendConversationally(ctx, body, topic);
         candidates.Add(new Candidate(body, "informative", StyleInformative,
             prior: 0.55, confidence: directAnswer is not null ? 0.85 : 0.5, body));
 
@@ -278,6 +285,11 @@ internal sealed class ResponseComposer
             confidence: 0.45, body));
 
         // 3. Concise ----------------------------------------------------------
+        // A talkative mind (Conversational.Rate > 1) de-prioritizes brevity:
+        // conciseness is a STYLE, and with rate 1.5+ the short candidate
+        // loses ground so the chattier bodies can win — the developer asked
+        // for longer, more conversational replies.
+        double rate = ctx.Mind.Config.Conversational.Rate;
         string shortBody = directAnswer is not null
             ? FirstSentence(directAnswer)
             : learned > 0
@@ -287,7 +299,8 @@ internal sealed class ResponseComposer
                     ? Pick($"Still fuzzy on {topic}.", $"No answer on {topic} yet - I only recall our chat about it.")
                     : Pick($"Not sure yet about {topic}.", $"No answer on {topic} yet.");
         candidates.Add(new Candidate(shortBody, "concise", StyleConcise,
-            prior: 0.45 + (1 - arousal) * 0.2, confidence: 0.4, shortBody));
+            prior: 0.45 + (1 - arousal) * 0.2 - Math.Max(0, rate - 1.0) * 0.3,
+            confidence: 0.4, shortBody));
 
         // 4. Reflective ---------------------------------------------------------
         if (ctx.Recalled.Count > 0)
@@ -359,6 +372,74 @@ internal sealed class ResponseComposer
         var fresh = options.Where(o => !_avoid.Contains(TemplateKey(o))).ToArray();
         var pool = fresh.Length > 0 ? fresh : options;
         return pool[_rng.Next(pool.Length)];
+    }
+
+    // ------------------------------------------------------------------
+    // CONVERSATIONAL RATE — how talkative she is. WithConversational(c =>
+    // c.rate(amount)) scales how much she speaks per reply: 1.0 keeps the
+    // classic pacing, 1.5+ appends one extra conversational sentence drawn
+    // from what the cycle actually gathered (related knowledge, second
+    // memories, her own sayings), and 2.0+ may add a second one — like a
+    // person who enjoys talking and carries the topic further. Extras are
+    // always declarative statements (follow-up questions stay under the
+    // Expression.AskFollowUpQuestions flag) and respect the anti-repetition
+    // avoidance set.
+    // ------------------------------------------------------------------
+    internal static string ExtendConversationally(CognitiveContext ctx, string body, string topic)
+    {
+        double rate = ctx.Mind.Config.Conversational.Rate;
+        if (rate < 1.5) return body;
+        int extras = rate >= 2.0 ? 2 : 1;
+        if (topic == "that") return body;
+
+        var available = new List<string>();
+
+        // 1. Related knowledge — a fact that shares the topic word.
+        if (ctx.Mind.Reasoning is { } reasoning)
+        {
+            foreach (var fact in reasoning.Knowledge.AllFacts())
+            {
+                var text = fact.ToString();
+                if (text.Length > 8 &&
+                    (fact.Subject.Contains(topic, StringComparison.OrdinalIgnoreCase) ||
+                     fact.Object.Contains(topic, StringComparison.OrdinalIgnoreCase)))
+                {
+                    available.Add($"Come to think of it - {char.ToLowerInvariant(text[0])}{text[1..].TrimEnd('.')}. So this topic goes deeper than one line.");
+                    break;
+                }
+            }
+        }
+
+        // 2. A second memory — another thread from the same ground.
+        if (ctx.Recalled.Count > 1)
+        {
+            var sideTopic = TopicOf(ctx.Recalled[1].Content);
+            if (sideTopic != topic && sideTopic != "that")
+                available.Add($"This also brushes against what I recall about {sideTopic} - one more thread I would love to pull someday.");
+        }
+
+        // 3. Her own sayings — the trained voice joins the chat.
+        var saying = ctx.Mind.Phrases.PickRelevant(ctx.EffectiveContent, ctx.Mind.Rng, 3)
+            .FirstOrDefault(s => TemplateKey(s) != TemplateKey(body));
+        if (saying is not null)
+            available.Add($"Somewhere in my own words, this fits: \"{saying}\"");
+
+        // 4. Pure conversational warmth — always available as the fallback.
+        available.Add($"I could honestly keep talking about {topic} for a while.");
+        available.Add($"Conversations that land on {topic} are the kind I remember.");
+
+        // Assemble: distinct templates, never repeating the body, capped at
+        // `extras` sentences. Candidates are shuffled by the caller's rng via
+        // ordering above; take from the most-grounded first.
+        var added = new List<string>();
+        foreach (var extra in available)
+        {
+            if (added.Count >= extras) break;
+            var key = TemplateKey(extra);
+            if (key == TemplateKey(body) || added.Any(a => TemplateKey(a) == key)) continue;
+            added.Add(extra);
+        }
+        return added.Count > 0 ? body + " " + string.Join(" ", added) : body;
     }
 
     /// <summary>
