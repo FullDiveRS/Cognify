@@ -16,6 +16,15 @@ public sealed class ExportOptions
     /// <summary>Human-readable description embedded in GGUF metadata.</summary>
     public string? Description { get; set; }
 
+    /// <summary>
+    /// Llama.cpp GGUF export only: extend <c>gpt2.context_length</c> to this
+    /// many tokens by linearly interpolating the trained position embeddings
+    /// (pi-style). Must be ≥ the trained context (16 by default); null keeps
+    /// the trained window. Positions past the trained range are interpolated,
+    /// so expect gradually degraded coherence well beyond it.
+    /// </summary>
+    public int? LlamaCppContextLength { get; set; }
+
     /// <summary>Maximum vocabulary size for tokenizer.json (including specials).</summary>
     public int VocabSize { get; set; } = 4096;
 
@@ -188,11 +197,14 @@ public static class MindExporter
     /// <summary>Exports the mind as a GGUF v3 file. The written file is
     /// re-read and verified (spec structure, alignment, data in range) before
     /// this method returns — a corrupt export fails here, not inside gguf
-    /// tooling later.</summary>
+    /// tooling later. <paramref name="path"/> is the <c>.gguf</c> FILE to
+    /// write; an existing directory target writes <c>&lt;name&gt;.gguf</c>
+    /// inside it (named after the mind), and missing parent folders are
+    /// created.</summary>
     public static void ExportGguf(Mind mind, string path, ExportOptions? options = null)
     {
         options ??= new ExportOptions();
-        string fullPath = Path.GetFullPath(path);
+        string fullPath = ResolveOutputFile(path, Sanitize(options.ModelName ?? mind.Name), ".gguf");
         BuildGguf(mind, options).Write(fullPath);
         var report = GgufDiagnostics.Inspect(fullPath);
         if (!report.SpecValid)
@@ -206,6 +218,9 @@ public static class MindExporter
     /// This is the file to hand to llama.cpp, Unsloth, or any GGUF runner —
     /// unlike the archive <see cref="ExportGguf"/> output (custom
     /// <c>cognify</c> architecture), a gpt2 GGUF loads and generates.
+    /// <paramref name="path"/> is the <c>.gguf</c> FILE to write; an existing
+    /// directory target writes <c>&lt;name&gt;-llamacpp.gguf</c> inside it,
+    /// and missing parent folders are created.
     /// </summary>
     public static LlamaCppGgufResult ExportGgufForLlamaCpp(Mind mind, string path, ExportOptions? options = null)
         => LlamaCppGgufExporter.Export(mind, path, options);
@@ -244,9 +259,8 @@ public static class MindExporter
             throw new InvalidOperationException(
                 "Cannot split a mind with no tensors into shards — attach WithSelfLearning() so the mind has trained weights to export.");
 
-        string fullPath = Path.GetFullPath(path);
+        string fullPath = ResolveOutputFile(path, Sanitize(options.ModelName ?? mind.Name), ".safetensors");
         string directory = Path.GetDirectoryName(fullPath) ?? Environment.CurrentDirectory;
-        Directory.CreateDirectory(directory);
 
         string fileName = Path.GetFileName(fullPath);
         string baseName = fileName.EndsWith(".safetensors", StringComparison.OrdinalIgnoreCase)
@@ -442,6 +456,23 @@ This bundle was produced by Cognify.MindExporter from a live cognitive mind.
         produced.Add("README.md");
 
         return produced;
+    }
+
+    /// <summary>Resolves an export target path. Export APIs write FILES (GGUF /
+    /// safetensors) — when <paramref name="path"/> is an existing directory the
+    /// file is written inside it as <c>&lt;defaultName&gt;&lt;extension&gt;</c>,
+    /// because opening a directory for writing would surface as a raw
+    /// UnauthorizedAccessException ("access denied"). Missing parent folders of
+    /// the resolved path are created as well.</summary>
+    internal static string ResolveOutputFile(string path, string defaultName, string extension)
+    {
+        string fullPath = Path.GetFullPath(path);
+        if (Directory.Exists(fullPath))
+            fullPath = Path.Combine(fullPath, defaultName + extension);
+        string? parent = Path.GetDirectoryName(fullPath);
+        if (!string.IsNullOrEmpty(parent))
+            Directory.CreateDirectory(parent);
+        return fullPath;
     }
 
     /// <summary>Flattens a 2-D array into row-major F32.</summary>

@@ -81,6 +81,7 @@ public sealed class MindBuilder
     {
         _enabled["thinking"] = enabled;
         _config.Thinking.UpTo(ceiling);
+        _config.Thinking.Enabled = enabled;   // keep the flag truthful — the GGUF exporter reads it
         configure?.Invoke(_config.Thinking);
         return this;
     }

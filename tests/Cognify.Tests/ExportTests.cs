@@ -264,6 +264,59 @@ public class ExportTests : IDisposable
     }
 
     [Fact]
+    public void Gguf_export_into_existing_directory_writes_default_file_inside()
+    {
+        using var mind = MinimalMind();          // "ExampleAI" sanitizes to "exampleai"
+        string target = Path.Combine(_dir, "export-folder");
+        Directory.CreateDirectory(target);
+
+        MindExporter.ExportGguf(mind, target);   // a DIRECTORY, not a .gguf path
+
+        string expected = Path.Combine(target, "exampleai.gguf");
+        Assert.True(File.Exists(expected), $"expected {expected} to exist");
+        var gguf = new GgufReader(expected);
+        Assert.Equal("exampleai", gguf.Metadata["general.name"].AsString());
+    }
+
+    [Fact]
+    public void Gguf_export_creates_missing_parent_folders()
+    {
+        using var mind = MinimalMind();
+        string path = Path.Combine(_dir, "does", "not", "exist", "yet.gguf");
+
+        MindExporter.ExportGguf(mind, path);
+
+        Assert.True(File.Exists(path));
+    }
+
+    [Fact]
+    public void Safetensors_export_into_existing_directory_writes_default_file_inside()
+    {
+        using var mind = MinimalMind();
+        string target = Path.Combine(_dir, "st-folder");
+        Directory.CreateDirectory(target);
+
+        MindExporter.ExportSafetensors(mind, target);
+
+        Assert.True(File.Exists(Path.Combine(target, "exampleai.safetensors")));
+    }
+
+    [Fact]
+    public void LlamaCpp_export_into_existing_directory_writes_default_file_inside()
+    {
+        using var mind = TrainedMind();
+        mind.TrainDeepModel(1);
+        string target = Path.Combine(_dir, "llamacpp-folder");
+        Directory.CreateDirectory(target);
+
+        var result = MindExporter.ExportGgufForLlamaCpp(mind, target);
+
+        string expected = Path.Combine(target, "yume-llamacpp.gguf");
+        Assert.True(File.Exists(expected), $"expected {expected} to exist");
+        Assert.Equal(expected, result.Path);
+    }
+
+    [Fact]
     public void LlamaCppGguf_requires_trained_transformer()
     {
         using var mind = MinimalMind();
@@ -271,6 +324,158 @@ public class ExportTests : IDisposable
         var ex = Assert.Throws<InvalidOperationException>(
             () => MindExporter.ExportGgufForLlamaCpp(mind, path));
         Assert.Contains("not trained", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("TrainDeepModel", ex.Message);   // the fix it actually needs
+    }
+
+    [Fact]
+    public void Small_corpus_needs_explicit_TrainDeepModel_before_llamacpp_export()
+    {
+        using var mind = MinimalMind();
+        string corpus = Path.Combine(_dir, "tiny.txt");
+        File.WriteAllLines(corpus,
+            new[] { "Fino is friendly.", "Fino likes code.", "The sky is blue." });
+
+        mind.TrainFile(corpus);   // feeds facts + the training buffer…
+        Assert.False(mind.NeuralLanguageModel.IsTrained,
+            "a 3-line corpus is far below the auto-train threshold (~600 tokens)");
+
+        mind.TrainDeepModel(1);   // …the explicit deep pass is what trains the transformer
+        Assert.True(mind.NeuralLanguageModel.IsTrained);
+    }
+
+    [Fact]
+    public void LlamaCppGguf_can_extend_context_with_position_interpolation()
+    {
+        using var mind = TrainedMind();
+        mind.TrainDeepModel(1);
+        var cfg = mind.NeuralLanguageModel.Config;
+        int trainedCtx = cfg.ContextLen, dim = cfg.Dim;
+
+        string path = Path.Combine(_dir, "extended.gguf");
+        var result = MindExporter.ExportGgufForLlamaCpp(mind, path,
+            new ExportOptions { LlamaCppContextLength = 64 });
+        Assert.Equal(64, result.ContextLength);
+
+        var gguf = new GgufReader(path);
+        Assert.Equal((uint)64, gguf.Metadata["gpt2.context_length"].AsUInt32());
+
+        var wpe = gguf.ReadTensor("position_embd.weight");
+        Assert.Equal(64 * dim, wpe.Length);
+
+        // pi interpolation: new position i reads trained position i*(C-1)/63 —
+        // so the first row is untouched and the last new row equals the last
+        // trained row.
+        var trainedWpe = MindExporter.ExtractTensors(mind)
+            .First(t => t.Name == "cognify.transformer.wpe");
+        for (int d = 0; d < dim; d++)
+        {
+            Assert.Equal(trainedWpe.Data[d], wpe[d]);
+            Assert.Equal(trainedWpe.Data[(trainedCtx - 1) * dim + d], wpe[63 * dim + d]);
+        }
+    }
+
+    [Fact]
+    public void LlamaCppGguf_rejects_context_below_the_trained_window()
+    {
+        using var mind = TrainedMind();
+        mind.TrainDeepModel(1);
+        int trainedCtx = mind.NeuralLanguageModel.Config.ContextLen;
+
+        var ex = Assert.Throws<ArgumentOutOfRangeException>(() =>
+            MindExporter.ExportGgufForLlamaCpp(mind, Path.Combine(_dir, "shrink.gguf"),
+                new ExportOptions { LlamaCppContextLength = trainedCtx - 1 }));
+        Assert.Contains("trained context", ex.Message);
+    }
+
+    [Fact]
+    public void LlamaCppGguf_writes_full_capability_metadata_and_chat_template()
+    {
+        using var mind = MindBuilder.Create("Kiro")
+            .Describe("A capability-check mind.")
+            .WithReasoning()
+            .WithThinking()
+            .WithMemory()
+            .WithEmotions()
+            .WithPersonality(p => p.Traits(openness: 0.8))
+            .WithGoals(g => g.AddGoal("help the user", 0.9, "kindness"))
+            .WithAudio()
+            .WithCode()
+            .WithTools()
+            .WithWebSearch()
+            .WithAutoWebFetch()
+            .Build();
+
+        string corpus = Path.Combine(_dir, "kiro.txt");
+        File.WriteAllLines(corpus, new[] { "Kiro is friendly.", "Kiro likes code.", "The sky is blue." });
+        mind.TrainFile(corpus);   // feed the buffer — TrainDeepModel needs tokens to chew
+        mind.TrainDeepModel(1);
+
+        string path = Path.Combine(_dir, "kiro.gguf");
+        MindExporter.ExportGgufForLlamaCpp(mind, path);
+
+        var gguf = new GgufReader(path);
+
+        // The registered module list IS the capability set.
+        var modules = gguf.Metadata["cognify.modules"].AsStringArray();
+        Assert.Contains("audio", modules);
+        Assert.Contains("code", modules);
+        Assert.Contains("tools", modules);
+        Assert.Contains("reasoning", modules);
+        Assert.DoesNotContain("vision", modules);
+
+        Assert.True(gguf.Metadata["cognify.audio.enabled"].AsBool());
+        Assert.True(gguf.Metadata["cognify.code.enabled"].AsBool());
+        Assert.True(gguf.Metadata["cognify.tools.enabled"].AsBool());
+        Assert.True(gguf.Metadata["cognify.reasoning.enabled"].AsBool());
+        Assert.True(gguf.Metadata["cognify.web_search.enabled"].AsBool());
+        Assert.True(gguf.Metadata["cognify.web_fetch.enabled"].AsBool());
+        Assert.False(gguf.Metadata["cognify.vision.enabled"].AsBool());
+        Assert.Equal("A capability-check mind.", gguf.Metadata["cognify.description"].AsString());
+
+        Assert.True(gguf.Metadata["cognify.tools.count"].AsUInt32() >= 3); // built-ins: clock, calculator, text-stats
+        Assert.Contains("clock", gguf.Metadata["cognify.tools.names"].AsStringArray());
+
+        var template = gguf.Metadata["tokenizer.chat_template"].AsString();
+        Assert.Contains("tools | tojson", template);
+        Assert.Contains("enable_thinking", template);        // Qwen3-style kwarg honored
+        Assert.Contains("assistant: thought:", template);    // thinking mind's cue
+
+        // The capability manifest rides inside the template (a Jinja set, no
+        // render output) and agrees with the KV metadata.
+        var m = System.Text.RegularExpressions.Regex.Match(
+            template, @"cognify_manifest = '(.*?)' %\}");
+        Assert.True(m.Success);
+        using var doc = JsonDocument.Parse(m.Groups[1].Value.Replace("\\u0027", "'"));
+        var caps = doc.RootElement.GetProperty("capabilities");
+        Assert.True(caps.GetProperty("audio").GetBoolean());
+        Assert.False(caps.GetProperty("vision").GetBoolean());
+        Assert.True(caps.GetProperty("tools").GetBoolean());
+        bool hasClock = false;
+        foreach (var n in doc.RootElement.GetProperty("tools").GetProperty("names").EnumerateArray())
+            if (n.GetString() == "clock") hasClock = true;
+        Assert.True(hasClock);
+        Assert.Equal(gguf.Metadata["cognify.thinking.level"].AsString(),
+            doc.RootElement.GetProperty("thinking").GetProperty("level").GetString());
+    }
+
+    [Fact]
+    public void LlamaCppGguf_chat_template_reflects_thinking_switch()
+    {
+        using var mind = MindBuilder.Create("Mute").WithThinking(enabled: false).Build();
+        string corpus = Path.Combine(_dir, "mute.txt");
+        File.WriteAllLines(corpus, new[] { "Mute is quiet.", "Mute likes code.", "The sky is blue." });
+        mind.TrainFile(corpus);
+        mind.TrainDeepModel(1);
+
+        string path = Path.Combine(_dir, "mute.gguf");
+        MindExporter.ExportGgufForLlamaCpp(mind, path);
+
+        var gguf = new GgufReader(path);
+        Assert.False(gguf.Metadata["cognify.thinking.enabled"].AsBool());
+        var template = gguf.Metadata["tokenizer.chat_template"].AsString();
+        Assert.DoesNotContain("thought:", template);         // no cue — this mind cannot think
+        Assert.EndsWith("assistant:", template);
+        Assert.Contains("cognify_manifest", template);
     }
 
     [Fact]

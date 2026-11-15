@@ -1,5 +1,6 @@
 using Cognify.Core;
 using System.Text;
+using System.Text.Json;
 
 namespace Cognify.Export;
 
@@ -34,7 +35,8 @@ public sealed class LlamaCppGgufResult
     /// <summary>Transformer block count.</summary>
     public int Layers { get; }
 
-    /// <summary>Trained context length.</summary>
+    /// <summary>Context length written to the GGUF (the trained window, or
+    /// the position-interpolated extension from ExportOptions).</summary>
     public int ContextLength { get; }
 
     /// <summary>FFN hidden dimension.</summary>
@@ -81,6 +83,9 @@ public static class LlamaCppGgufExporter
 
     /// <summary>
     /// Exports the trained transformer as a llama.cpp-runnable gpt2 GGUF.
+    /// <paramref name="path"/> is the <c>.gguf</c> FILE to write; an existing
+    /// directory target writes <c>&lt;name&gt;-llamacpp.gguf</c> inside it,
+    /// and missing parent folders are created.
     /// Throws <see cref="InvalidOperationException"/> when the neural language
     /// model has not been trained yet.
     /// </summary>
@@ -90,8 +95,10 @@ public static class LlamaCppGgufExporter
         var neural = mind.NeuralLanguageModel;
         if (!neural.IsTrained)
             throw new InvalidOperationException(
-                "The neural language model is not trained yet — run training (e.g. mind.Train(...) or " +
-                "train_file) before exporting for llama.cpp. The gpt2 GGUF needs real transformer weights.");
+                "The neural language model is not trained yet — call mind.TrainDeepModel(epochs) explicitly " +
+                "before exporting for llama.cpp (train_file only feeds the training buffer; the automatic pass " +
+                "fires by itself only after ~" + Cognify.Learning.TransformerLM.AutoTrainTokens + " new tokens). " +
+                "The gpt2 GGUF needs real transformer weights.");
 
         var cfg = neural.Config;
         var vocab = neural.ExportVocab();
@@ -102,12 +109,29 @@ public static class LlamaCppGgufExporter
         int dim = cfg.Dim;
         int layers = cfg.Layers;
         int heads = cfg.Heads;
-        int context = cfg.ContextLen;
 
         var wte = tensors[$"{Prefix}wte"];                       // [V][D]
         var wpe = tensors[$"{Prefix}wpe"];                       // [C][D]
         int vocabSize = (int)wte.Shape[0];
         int ffn = (int)tensors[$"{Prefix}l0.ffn.w1"].Shape[0];   // F1 rows = FFN width
+
+        // Context extension (opt-in): the transformer trained with learned
+        // absolute position embeddings for cfg.ContextLen tokens, so that
+        // window is baked into the weights. A longer GGUF window is possible
+        // by linearly interpolating (pi-style) the trained rows onto the
+        // requested range — llama.cpp then accepts -c up to the new length.
+        int context = (int)wpe.Shape[0];
+        float[] wpeData = wpe.Data;
+        long[] wpeShape = wpe.Shape;
+        if (options.LlamaCppContextLength is int wanted && wanted != context)
+        {
+            if (wanted < context)
+                throw new ArgumentOutOfRangeException(nameof(options),
+                    $"LlamaCppContextLength ({wanted}) cannot be below the trained context ({context}).");
+            wpeData = InterpolatePositions(wpe.Data, context, wanted, dim);
+            wpeShape = new long[] { wanted, dim };
+            context = wanted;
+        }
 
         // Every tensor we write, kept for the post-write self-verification.
         var writer = new GgufWriter();
@@ -137,8 +161,12 @@ public static class LlamaCppGgufExporter
 
         WriteTokenizer(writer, vocab);
 
+        // Capability metadata — what the mind carries, tagged on the weights.
+        WriteCapabilityMetadata(writer, mind);
+
         // Identity metadata — travels with the runnable weights.
-        writer.AddBool("cognify.thinking.enabled", mind.Config.Thinking.Enabled);
+        writer.AddBool("cognify.thinking.enabled",
+            mind.Modules.Any(m => m.Name == "thinking"));
         writer.AddString("cognify.thinking.level",
             mind.Config.Thinking.Level.ToString().ToLowerInvariant());
         writer.AddString("cognify.thinking.ceiling",
@@ -146,7 +174,7 @@ public static class LlamaCppGgufExporter
         writer.AddUInt32("cognify.cycles", (uint)mind.CycleCount);
 
         Add(new TensorSpec("token_embd.weight", wte.Data, wte.Shape));      // [V][D], tied output head
-        Add(new TensorSpec("position_embd.weight", wpe.Data, wpe.Shape));   // [C][D]
+        Add(new TensorSpec("position_embd.weight", wpeData, wpeShape));   // [C][D], interpolated when requested
 
         for (int l = 0; l < layers; l++)
         {
@@ -174,8 +202,8 @@ public static class LlamaCppGgufExporter
         Add(new TensorSpec("output_norm.weight", tensors[$"{Prefix}lnf.g"].Data, dim));
         Add(new TensorSpec("output_norm.bias", tensors[$"{Prefix}lnf.b"].Data, dim));
 
-        string fullPath = Path.GetFullPath(path);
-        Directory.CreateDirectory(Path.GetDirectoryName(fullPath) ?? Environment.CurrentDirectory);
+        string fullPath = MindExporter.ResolveOutputFile(path,
+            MindExporter.Sanitize(options.ModelName ?? mind.Name) + "-llamacpp", ".gguf");
         writer.Write(fullPath);
 
         // ---- post-write self-verification ---------------------------------
@@ -211,6 +239,29 @@ public static class LlamaCppGgufExporter
             layers, context, ffn, new FileInfo(fullPath).Length);
     }
 
+    /// <summary>
+    /// Resamples the trained absolute position embeddings ([srcCtx][dim],
+    /// row-major) onto [dstCtx][dim] by linear interpolation (pi-style):
+    /// new position i reads trained position i*(src-1)/(dst-1), so the
+    /// trained window stretches over the extended context and both end rows
+    /// are preserved exactly.
+    /// </summary>
+    private static float[] InterpolatePositions(float[] trained, int srcCtx, int dstCtx, int dim)
+    {
+        var result = new float[dstCtx * dim];
+        for (int i = 0; i < dstCtx; i++)
+        {
+            double s = (double)i * (srcCtx - 1) / (dstCtx - 1);
+            int i0 = (int)s;
+            int i1 = Math.Min(i0 + 1, srcCtx - 1);
+            double t = s - i0;
+            int b0 = i0 * dim, b1 = i1 * dim, b = i * dim;
+            for (int d = 0; d < dim; d++)
+                result[b + d] = (float)((1 - t) * trained[b0 + d] + t * trained[b1 + d]);
+        }
+        return result;
+    }
+
     private static TensorSpec FuseQkv(string name, TensorSpec wq, TensorSpec wk, TensorSpec wv)
     {
         int rows = (int)wq.Shape[0], cols = (int)wq.Shape[1];
@@ -238,6 +289,100 @@ public static class LlamaCppGgufExporter
         }
         return new TensorSpec(name, fused, n * 3);
     }
+
+    /// <summary>
+    /// Capability metadata — mirrors the MindBuilder switches. The registered
+    /// module list IS the capability set (WithAudio/WithCode/WithTools/…
+    /// attach modules at build time); llama.cpp ignores unknown keys, but any
+    /// harness reading the file can see what the mind carries. Alongside it,
+    /// <c>tokenizer.chat_template</c> gives llama-server <c>--jinja</c> /
+    /// Unsloth a working chat format — the one capability key llama.cpp
+    /// actually honors at request time.
+    /// </summary>
+    private static void WriteCapabilityMetadata(GgufWriter writer, Mind mind)
+    {
+        var modules = mind.Modules.Select(m => m.Name).ToList();
+        bool Has(string module) => modules.Contains(module);
+
+        var thinking = new Dictionary<string, object?>
+        {
+            // Module presence is the truth — a mind built without WithThinking
+            // has no thinking module regardless of option defaults.
+            ["enabled"] = Has("thinking"),
+            ["level"] = mind.Config.Thinking.Level.ToString().ToLowerInvariant(),
+            ["ceiling"] = mind.Config.Thinking.Ceiling.ToString().ToLowerInvariant(),
+        };
+        var capabilities = new Dictionary<string, object?>
+        {
+            ["reasoning"] = Has("reasoning"),
+            ["memory"] = Has("memory"),
+            ["emotions"] = Has("emotions"),
+            ["personality"] = Has("personality"),
+            ["goals"] = Has("goals"),
+            ["audio"] = Has("audio"),
+            ["vision"] = Has("vision"),
+            ["code"] = Has("code"),
+            ["embeddings"] = Has("embeddings"),
+            ["multilingual"] = Has("multilingual"),
+            ["self_learning"] = Has("learning"),
+            ["media_generation"] = Has("generation"),
+            ["tools"] = Has("tools"),
+            ["web_search"] = mind.Config.Tools.AllowWebSearch,
+            ["web_fetch"] = mind.Config.Tools.AutoFetchWeb,
+        };
+        var toolNames = mind.Tools?.Registry.All().Select(t => t.Name).ToList()
+                        ?? new List<string>();
+
+        writer.AddStringArray("cognify.modules", modules);
+        foreach (var (cap, on) in capabilities)
+            writer.AddBool($"cognify.{cap}.enabled", Convert.ToBoolean(on));
+        if (toolNames.Count > 0)
+        {
+            writer.AddUInt32("cognify.tools.count", (uint)toolNames.Count);
+            writer.AddStringArray("cognify.tools.names", toolNames);
+        }
+        if (!string.IsNullOrEmpty(mind.Config.Description))
+            writer.AddString("cognify.description", mind.Config.Description);
+
+        // The manifest also rides inside the chat template as a Jinja `set`
+        // (renders no output): llama-server exposes the template via
+        // GET /props, so any client — cognify-chat.html, an agent harness,
+        // Unsloth-style UIs — can read what this mind carries and gray out
+        // what is missing. Single source of truth with the KV keys above.
+        var manifest = JsonSerializer.Serialize(new Dictionary<string, object?>
+        {
+            ["version"] = 1,
+            ["description"] = mind.Config.Description ?? string.Empty,
+            ["thinking"] = thinking,
+            ["capabilities"] = capabilities,
+            ["tools"] = new Dictionary<string, object?>
+            {
+                ["enabled"] = Convert.ToBoolean(capabilities["tools"]),
+                ["count"] = toolNames.Count,
+                ["names"] = toolNames,
+            },
+        });
+        writer.AddString("tokenizer.chat_template",
+            ChatTemplate(manifest.Replace("'", "\\u0027"),
+                Convert.ToBoolean(thinking["enabled"])));
+    }
+
+    /// <summary>
+    /// Minimal Jinja chat template — llama.cpp's minja and Unsloth render it
+    /// when the file is served with <c>--jinja</c>: an optional OpenAI-style
+    /// tools block (rendered as JSON via <c>tojson</c>), then
+    /// <c>role: content</c> lines, ending on the assistant cue. Thinking
+    /// minds honor Qwen3's <c>enable_thinking</c> kwarg (sent as
+    /// <c>chat_template_kwargs</c> by UIs): false drops the "thought:" cue.
+    /// </summary>
+    internal static string ChatTemplate(string manifestJson, bool thinkingEnabled) =>
+        "{%- set cognify_manifest = '" + manifestJson + "' %}\n" +
+        "{%- if tools %}tools: {{ tools | tojson }}\n" +
+        "{% endif %}{% for m in messages %}{{ m['role'] }}: {{ m['content'] }}\n" +
+        "{% endfor %}" +
+        (thinkingEnabled
+            ? "{%- if enable_thinking is defined and not enable_thinking %}assistant:{% else %}assistant: thought:{% endif %}"
+            : "assistant:");
 
     // ---- tokenizer ---------------------------------------------------------
 
