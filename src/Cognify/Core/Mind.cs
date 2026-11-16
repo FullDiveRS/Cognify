@@ -1164,6 +1164,15 @@ public sealed class Mind : IDisposable
         NeuralLanguageModel.Train(epochs);
 
     /// <summary>
+    /// Deep-trains with full loop control: a per-run learning rate with
+    /// per-epoch decay, early stopping when the loss stalls, a progress
+    /// callback per epoch, and per-epoch losses in the report. Never throws:
+    /// with too little language it reports zero epochs.
+    /// </summary>
+    public Cognify.Learning.TransformerTrainingReport TrainDeepModel(Cognify.Learning.TransformerTrainOptions options) =>
+        NeuralLanguageModel.Train(options);
+
+    /// <summary>
     /// Detects the language of a text. Throws when the multilingual module is
     /// not enabled and the mind is not lenient; in lenient mode null is returned.
     /// </summary>

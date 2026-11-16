@@ -281,4 +281,65 @@ public class TransformerTests
         Assert.Contains("cognify.transformer.l0.attn.wq", names);
         Assert.Contains("cognify.transformer.lnf.g", names);
     }
+
+    [Fact]
+    public void TrainLoop_ReportsPerEpochLossAndProgress()
+    {
+        var lm = new TransformerLM(TinyConfig());
+        foreach (var line in Corpus) lm.Observe(line);
+
+        var seen = new List<(int Epoch, double Loss)>();
+        var report = lm.Train(new TransformerTrainOptions
+        {
+            Epochs = 6,
+            Progress = (epoch, total, loss) => seen.Add((epoch, loss)),
+        });
+
+        Assert.Equal(6, report.PerEpochLosses!.Count);
+        Assert.Equal(6, seen.Count);
+        Assert.Equal(6, seen[^1].Epoch);
+        Assert.Equal(report.FinalLoss, seen[^1].Loss, 9);
+        Assert.True(report.InitialLoss > report.FinalLoss);   // training reduces loss
+        Assert.False(report.StoppedEarly);
+        Assert.All(report.PerEpochLosses, l => Assert.True(double.IsFinite(l)));
+        Assert.Equal(1, report.LearningRates!.Distinct().Count());   // no decay → one rate
+    }
+
+    [Fact]
+    public void TrainLoop_DecaysLearningRate()
+    {
+        var lm = new TransformerLM(TinyConfig());
+        foreach (var line in Corpus) lm.Observe(line);
+
+        var report = lm.Train(new TransformerTrainOptions
+        {
+            Epochs = 4, LearningRate = 0.01, Decay = 0.5,
+        });
+
+        Assert.Equal(4, report.LearningRates!.Count);
+        Assert.Equal(0.01, report.LearningRates[0], 12);
+        Assert.Equal(0.005, report.LearningRates[1], 12);
+        Assert.Equal(0.0025, report.LearningRates[2], 12);
+        Assert.Equal(0.00125, report.LearningRates[3], 12);
+    }
+
+    [Fact]
+    public void TrainLoop_StopsEarlyWhenLossStalls()
+    {
+        var lm = new TransformerLM(TinyConfig());
+        foreach (var line in Corpus) lm.Observe(line);
+
+        var epochsSeen = new List<int>();
+        var report = lm.Train(new TransformerTrainOptions
+        {
+            Epochs = 20, MinDelta = 10.0, Patience = 2,
+            Progress = (epoch, total, loss) => epochsSeen.Add(epoch),
+        });
+
+        Assert.True(report.StoppedEarly);
+        Assert.Equal(3, report.Epochs);              // 1 progress epoch + 2 stagnant
+        Assert.Equal(3, report.PerEpochLosses!.Count);
+        Assert.Equal(3, epochsSeen.Count);
+        Assert.True(report.Epochs < 20);
+    }
 }

@@ -74,6 +74,15 @@ public sealed record TransformerTrainingReport
     /// <summary>Wall-clock duration of the whole pass.</summary>
     public TimeSpan Duration { get; init; }
 
+    /// <summary>Mean loss of each epoch, in order (empty when no epoch ran).</summary>
+    public List<double>? PerEpochLosses { get; init; }
+
+    /// <summary>The learning rate used at each epoch, in order — visible decay.</summary>
+    public List<double>? LearningRates { get; init; }
+
+    /// <summary>True when Patience stopped the run before all planned epochs.</summary>
+    public bool StoppedEarly { get; init; }
+
     public override string ToString() =>
         $"{Epochs} epoch(s) on {Windows} window(s): loss {InitialLoss:F3} -> {FinalLoss:F3} " +
         $"({Parameters:N0} parameters, {Vocabulary} words, {Duration.TotalMilliseconds:F0} ms)";
@@ -374,7 +383,7 @@ public sealed class TransformerLM
     public TransformerTrainingReport? AutoTrain()
     {
         lock (_gate)
-            return ShouldAutoTrain ? TrainLocked(AutoTrainEpochs) : null;
+            return ShouldAutoTrain ? TrainLocked(TransformerTrainOptions.For(AutoTrainEpochs)) : null;
     }
 
     /// <summary>
@@ -384,10 +393,21 @@ public sealed class TransformerLM
     public TransformerTrainingReport Train(int epochs = 12)
     {
         lock (_gate)
-            return TrainLocked(Math.Max(1, epochs));
+            return TrainLocked(new TransformerTrainOptions { Epochs = Math.Max(1, epochs) });
     }
 
-    private TransformerTrainingReport TrainLocked(int epochs)
+    /// <summary>
+    /// Trains with full loop control — epochs, a per-run learning rate with
+    /// per-epoch decay, early stopping on stalled loss, and a progress
+    /// callback fired after every epoch. See <see cref="TransformerTrainOptions"/>.
+    /// </summary>
+    public TransformerTrainingReport Train(TransformerTrainOptions options)
+    {
+        lock (_gate)
+            return TrainLocked(options);
+    }
+
+    private TransformerTrainingReport TrainLocked(TransformerTrainOptions options)
     {
         var clock = Stopwatch.StartNew();
 
@@ -409,6 +429,7 @@ public sealed class TransformerLM
             {
                 Epochs = 0, Windows = 0, InitialLoss = _lastLoss, FinalLoss = _lastLoss,
                 Parameters = ParameterCount, Vocabulary = _vocab.Count, Duration = clock.Elapsed,
+                PerEpochLosses = new List<double>(), LearningRates = new List<double>(),
             };
         }
 
@@ -455,7 +476,19 @@ public sealed class TransformerLM
         var rng = new Random(_cfg.Seed + _epochsTrained * 7919);
         double initialLoss = double.NaN, finalLoss = double.NaN;
 
-        for (int e = 0; e < epochs; e++)
+        // The training loop: each epoch shuffles the windows, runs Adam
+        // batches at the run's learning rate, reports the epoch loss to the
+        // Progress callback, then decays the rate. Patience + MinDelta stop
+        // the run early when the loss stops improving.
+        int planned = Math.Max(1, options.Epochs);
+        double lr = options.LearningRate ?? _cfg.LearningRate;
+        var perEpoch = new List<double>();
+        var rates = new List<double>();
+        double best = double.PositiveInfinity;
+        int stagnant = 0, ran = 0;
+        bool stoppedEarly = false;
+
+        for (int e = 0; e < planned; e++)
         {
             // Fisher-Yates with the epoch rng, then take a bounded sample.
             for (int i = order.Length - 1; i > 0; i--)
@@ -470,31 +503,50 @@ public sealed class TransformerLM
             for (int start = 0; start < epochWindowCount; start += _cfg.BatchSize)
             {
                 int end = Math.Min(epochWindowCount, start + _cfg.BatchSize);
-                double loss = TrainBatch(windowsX, windowsY, order, start, end);
+                double loss = TrainBatch(windowsX, windowsY, order, start, end, lr);
                 if (double.IsNaN(initialLoss)) initialLoss = loss;
                 lossSum += loss * (end - start);
                 lossN += end - start;
             }
             finalLoss = lossN > 0 ? lossSum / lossN : finalLoss;
             _lastLoss = finalLoss;
+            perEpoch.Add(finalLoss);
+            rates.Add(lr);
+            ran = e + 1;
+            options.Progress?.Invoke(ran, planned, finalLoss);
+
+            if (finalLoss < best - options.MinDelta)
+            {
+                best = finalLoss;
+                stagnant = 0;
+            }
+            else if (options.Patience > 0 && ++stagnant >= options.Patience && ran < planned)
+            {
+                stoppedEarly = true;
+                break;
+            }
+            lr *= options.Decay;
         }
 
-        _epochsTrained += epochs;
+        _epochsTrained += ran;
         clock.Stop();
         return new TransformerTrainingReport
         {
-            Epochs = epochs,
+            Epochs = ran,
             Windows = epochWindowCount,
             InitialLoss = double.IsNaN(initialLoss) ? finalLoss : initialLoss,
             FinalLoss = finalLoss,
             Parameters = ParameterCount,
             Vocabulary = _vocab.Count,
             Duration = clock.Elapsed,
+            PerEpochLosses = perEpoch,
+            LearningRates = rates,
+            StoppedEarly = stoppedEarly,
         };
     }
 
-    // Trains one Adam batch of windows; returns the batch's mean loss.
-    private double TrainBatch(List<int[]> xs, List<int[]> ys, int[] order, int start, int end)
+    // Trains one Adam batch of windows at the given rate; returns the batch's mean loss.
+    private double TrainBatch(List<int[]> xs, List<int[]> ys, int[] order, int start, int end, double lr)
     {
         int t = _cfg.ContextLen, v = _vocab.Count;
         var grads = NewGrads();
@@ -530,7 +582,7 @@ public sealed class TransformerLM
         }
 
         int batch = end - start;
-        ApplyGrads(grads, batch);
+        ApplyGrads(grads, batch, lr);
         return lossSum / batch;
     }
 
@@ -1062,7 +1114,7 @@ public sealed class TransformerLM
 
     // Adam step on every tensor: divide accumulated grads by batch size,
     // clip the global norm, then let the optimizer do its thing.
-    private void ApplyGrads(GradSet g, int batch)
+    private void ApplyGrads(GradSet g, int batch, double lr)
     {
         double inv = 1.0 / batch;
 
@@ -1110,7 +1162,6 @@ public sealed class TransformerLM
             }
         }
 
-        double lr = _cfg.LearningRate;
         _adam.Step("wte", _wte, g.GWte, lr);
         _adam.Step("wpe", _wpe, g.GWpe, lr);
         _adam.StepVec("lnf.g", _lnFG, g.GLnFG, lr);
