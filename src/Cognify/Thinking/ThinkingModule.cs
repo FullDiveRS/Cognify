@@ -33,6 +33,10 @@ public sealed class ThinkingModule : CognitiveModuleBase
 
     internal ThinkingModule(ThinkingOptions options) => _options = options;
 
+    /// <summary>The mind's own thinking switch — module presence is the
+    /// source of truth (mirrors Python's ``thinking_options.enabled``).</summary>
+    public bool Enabled => _options.Enabled;
+
     /// <inheritdoc />
     public override string Name => "thinking";
 
@@ -82,6 +86,10 @@ public sealed class ThinkingModule : CognitiveModuleBase
                 context.Features = features;
                 creditLearner.ObserveAction(features, existing.StyleId); // credit the specialized style
             }
+            // Reasoning ran earlier in the cycle — surface its trace too,
+            // so reasoning appears alongside thinking even when a
+            // perception/action module took the response.
+            AddReasoningSteps(chain, context);
             chain.Add(ThoughtPhase.Conclude,
                 $"A dedicated module ('{existing.StyleName}') already answered; keeping its response.",
                 existing.Confidence);
@@ -107,11 +115,15 @@ public sealed class ThinkingModule : CognitiveModuleBase
                 .FirstOrDefault() ?? direct.FirstOrDefault();
             if (fallback is null)
             {
+                AddReasoningSteps(chain, context);
                 chain.Add(ThoughtPhase.Conclude, "Thinking is disabled and nothing could be composed.", 0.3);
                 chain.Conclusion = "";
                 chain.Confidence = 0.3;
                 return;
             }
+            // Reasoning still ran this cycle — show its trace before the
+            // honest one-step conclusion.
+            AddReasoningSteps(chain, context);
             chain.Add(ThoughtPhase.Conclude, "Thinking is disabled - answered directly.", 0.5);
             Stream.Add("Conclude", fallback.Content, 0.5);
             chain.Conclusion = fallback.Content;
@@ -150,6 +162,13 @@ public sealed class ThinkingModule : CognitiveModuleBase
                 0.4 + emo.DominantIntensity * 0.5);
             Stream.Add("Feel", chain.Steps[^1].Text);
         }
+
+        // 3b. REASON, ALONGSIDE ----------------------------------------------
+        // The reasoning module ran earlier this cycle and spent its own
+        // budget; its trace (arithmetic steps, knowledge lookups, fresh
+        // inference) now joins the chain of thought — reasoning appears
+        // alongside thinking instead of only feeding the answer silently.
+        AddReasoningSteps(chain, context);
 
         // 4. Hypothesize -----------------------------------------------------
         var answer = context.Reasoning?.Answer;
@@ -510,6 +529,32 @@ public sealed class ThinkingModule : CognitiveModuleBase
             Add(ResponseComposer.StyleEmpathetic, 0.05);
         }
         return bias;
+    }
+
+    /// <summary>
+    /// Surfaces the reasoning module's explanation trace inside the chain of
+    /// thought: reasoning appears ALONGSIDE thinking in the same cycle —
+    /// arithmetic steps, knowledge lookups and fresh inference show up as
+    /// Hypothesize steps next to thinking's own phases, instead of only
+    /// feeding the answer silently. Only budget-trimmed lines reach this
+    /// point (the reasoning module already spent its budget); the trace is
+    /// capped at four steps so the chain stays readable, and the redundant
+    /// "Direct knowledge lookup for …" line is skipped because the knowledge
+    /// step says it better.
+    /// </summary>
+    private void AddReasoningSteps(ChainOfThought chain, CognitiveContext context)
+    {
+        var reasoning = context.Reasoning;
+        if (reasoning is null) return;
+        int shown = 0;
+        foreach (var line in reasoning.Explanations)
+        {
+            if (shown >= 4) break;
+            if (line.StartsWith("Direct knowledge lookup", StringComparison.Ordinal)) continue;
+            chain.Add(ThoughtPhase.Hypothesize, $"Reasoning: {Truncate(line, 90)}", 0.7);
+            Stream.Add("Hypothesize", chain.Steps[^1].Text, 0.7);
+            shown++;
+        }
     }
 
     private static string Truncate(string text, int max) =>

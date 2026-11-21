@@ -26,11 +26,34 @@ public sealed class ReasoningResult
     /// </summary>
     public int FactsLearned { get; internal set; }
 
+    /// <summary>
+    /// The reasoning tokens this cycle spent on the trace and the budget it
+    /// had (level ladder or a global budget) — visible so hosts and tests
+    /// can see the reasoning module's own budget at work, lined up with the
+    /// thinking budget.
+    /// </summary>
+    public int BudgetUsed { get; internal set; }
+
+    /// <summary>The budget the cycle was allowed to spend (0 when unset).</summary>
+    public int BudgetLimit { get; internal set; }
+
     private readonly List<Fact> _inferred = new();
     private readonly List<string> _explanations = new();
 
     internal void AddInferred(Fact fact) => _inferred.Add(fact);
     internal void AddExplanation(string text) => _explanations.Add(text);
+
+    /// <summary>
+    /// Internal: keeps only the first <paramref name="keepCount"/>
+    /// explanation lines — the reasoning budget trims the visible trace
+    /// (never the facts) when a cycle would overshoot its token budget.
+    /// </summary>
+    internal void TrimExplanations(int keepCount)
+    {
+        if (keepCount < 0) keepCount = 0;
+        if (keepCount < _explanations.Count)
+            _explanations.RemoveRange(keepCount, _explanations.Count - keepCount);
+    }
 }
 
 /// <summary>

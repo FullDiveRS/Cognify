@@ -24,4 +24,9 @@
     <ProjectReference Include="..\..\src\Cognify\Cognify.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <None Include="Templates/**/*" CopyToOutputDirectory="PreserveNewest" LinkBase="Templates" />
+    <None Include="Goldens/**/*" CopyToOutputDirectory="PreserveNewest" LinkBase="Goldens" />
+  </ItemGroup>
+
 </Project>

@@ -344,6 +344,7 @@ public sealed class ReasoningModule : CognitiveModuleBase
             }
             if (learnedNow > 0)
                 result.AddExplanation($"Learned {learnedNow} new fact(s) from the input.");
+            ApplyBudget(result, context);
             context.Reasoning = result;
             return;
         }
@@ -357,12 +358,15 @@ public sealed class ReasoningModule : CognitiveModuleBase
             context.Bag["reasoning.mathAttempted"] = "1";
         }
 
-        // 2. For statements, run forward chaining to expand knowledge.
+        // 2. For statements, run forward chaining to expand knowledge. The
+        //    depth comes from the level ladder (Low 2 … Max 12 passes) unless
+        //    Depth() pinned an explicit value — the reasoning level sizes the
+        //    pass count the same way the thinking level sizes thought steps.
         var result2 = new ReasoningResult();
         result2.FactsLearned = learnedNow;
         if (learnedNow > 0)
             result2.AddExplanation($"Learned {learnedNow} new fact(s) from the input.");
-        var derived = Engine.ForwardChain();
+        var derived = Engine.ForwardChain(_options.EffectiveDepth);
         foreach (var fact in derived.Take(5))
             result2.AddExplanation($"Inferred: {fact} (confidence {fact.Confidence:0.00})");
         foreach (var fact in derived) result2.AddInferred(fact);
@@ -387,7 +391,52 @@ public sealed class ReasoningModule : CognitiveModuleBase
                 result2.AddExplanation($"Induced new relation from repeated observation: {fact}");
         }
 
+        ApplyBudget(result2, context);
         context.Reasoning = result2;
         context.Bag["reasoning.newFacts"] = derived.Count;
     }
+
+    // ------------------------------------------------------------------
+    // Reasoning budget — lined up with thinking
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// Spends the cycle's reasoning budget on the explanation trace: the
+    /// level ladder (or a global <c>Budget(n)</c>) allows roughly N tokens
+    /// of arithmetic, lookup, inference and induction explanations per
+    /// cycle, mirroring how thinking spends its own budget on generated
+    /// thoughts. Lines beyond the budget are dropped — the facts themselves
+    /// stay in the knowledge base, only the visible trace is trimmed — and
+    /// the spend is recorded in the context bag for streams and tests.
+    /// </summary>
+    private void ApplyBudget(ReasoningResult result, CognitiveContext context)
+    {
+        int budget = _options.TokensFor(_options.Level);
+        int total = result.Explanations.Count;
+        int used = 0, keep = 0;
+        foreach (var line in result.Explanations)
+        {
+            int cost = EstimateTokens(line);
+            if (used + cost > budget) break;
+            used += cost;
+            keep++;
+        }
+        result.TrimExplanations(keep);
+        result.BudgetUsed = used;
+        result.BudgetLimit = budget;
+        context.Bag["reasoning.budget.used"] = used;
+        context.Bag["reasoning.budget.limit"] = budget;
+        if (total > keep)
+            context.Bag["reasoning.budget.trimmed"] = total - keep;
+    }
+
+    /// <summary>
+    /// Rough token estimate for an explanation line — whitespace-separated
+    /// words, the same granularity the thinking budget uses when it turns a
+    /// token budget into thought rounds (50 tokens ≈ one thought).
+    /// </summary>
+    private static int EstimateTokens(string text) =>
+        string.IsNullOrWhiteSpace(text)
+            ? 0
+            : text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).Length;
 }

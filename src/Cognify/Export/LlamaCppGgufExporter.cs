@@ -164,13 +164,38 @@ public static class LlamaCppGgufExporter
         // Capability metadata — what the mind carries, tagged on the weights.
         WriteCapabilityMetadata(writer, mind);
 
-        // Identity metadata — travels with the runnable weights.
+        // Identity metadata — travels with the runnable weights. Level names
+        // follow llama.cpp's --reasoning-effort ladder (low, medium, high,
+        // xhigh, max) so serving stacks can map them 1:1.
         writer.AddBool("cognify.thinking.enabled",
             mind.Modules.Any(m => m.Name == "thinking"));
         writer.AddString("cognify.thinking.level",
-            mind.Config.Thinking.Level.ToString().ToLowerInvariant());
+            EffortName(mind.Config.Thinking.Level));
         writer.AddString("cognify.thinking.ceiling",
             mind.Config.Thinking.Ceiling.ToString().ToLowerInvariant());
+        writer.AddUInt32("cognify.thinking.budget",
+            (uint)mind.Config.Thinking.TokensFor(mind.Config.Thinking.Level));
+        writer.AddBool("cognify.reasoning.enabled",
+            mind.Modules.Any(m => m.Name == "reasoning") && mind.Config.Reasoning.Enabled);
+        writer.AddString("cognify.reasoning.level",
+            EffortName(mind.Config.Reasoning.Level));
+        writer.AddString("cognify.reasoning.ceiling",
+            mind.Config.Reasoning.Ceiling.ToString().ToLowerInvariant());
+        writer.AddUInt32("cognify.reasoning.budget",
+            (uint)mind.Config.Reasoning.TokensFor(mind.Config.Reasoning.Level));
+
+        // Recommended sampling profile — sized to the vocabulary. Tiny
+        // word-level models degenerate into "what you is what you" loops at
+        // hot temperatures with no repetition penalty, and have no learned
+        // sense of when to stop, so the profile caps the reply and tames
+        // the sampling. Serving stacks can read these keys instead of
+        // guessing (Unsloth: set the same values in its sampling panel).
+        var sampling = SamplingFor(vocabSize);
+        writer.AddFloat32("cognify.sampling.temperature", sampling.Temperature);
+        writer.AddFloat32("cognify.sampling.top_p", sampling.TopP);
+        writer.AddUInt32("cognify.sampling.top_k", sampling.TopK);
+        writer.AddFloat32("cognify.sampling.repeat_penalty", sampling.RepeatPenalty);
+        writer.AddUInt32("cognify.sampling.max_tokens", sampling.MaxTokens);
         writer.AddUInt32("cognify.cycles", (uint)mind.CycleCount);
 
         Add(new TensorSpec("token_embd.weight", wte.Data, wte.Shape));      // [V][D], tied output head
@@ -309,8 +334,26 @@ public static class LlamaCppGgufExporter
             // Module presence is the truth — a mind built without WithThinking
             // has no thinking module regardless of option defaults.
             ["enabled"] = Has("thinking"),
-            ["level"] = mind.Config.Thinking.Level.ToString().ToLowerInvariant(),
+            ["level"] = EffortName(mind.Config.Thinking.Level),
             ["ceiling"] = mind.Config.Thinking.Ceiling.ToString().ToLowerInvariant(),
+            // The effort ladder this mind implements (lowest→highest, the
+            // level names llama.cpp's --reasoning-effort expects) and the
+            // token budget each level buys — clients can implement the
+            // levels directly from /props.
+            ["levels"] = EffortLevels(mind.Config.Thinking.Ceiling),
+            ["budget"] = mind.Config.Thinking.TokensFor(mind.Config.Thinking.Level),
+            ["budgets"] = BudgetLadder(mind.Config.Thinking.Ceiling,
+                mind.Config.Thinking.TokensFor),
+        };
+        var reasoning = new Dictionary<string, object?>
+        {
+            ["enabled"] = Has("reasoning") && mind.Config.Reasoning.Enabled,
+            ["level"] = EffortName(mind.Config.Reasoning.Level),
+            ["ceiling"] = mind.Config.Reasoning.Ceiling.ToString().ToLowerInvariant(),
+            ["levels"] = EffortLevels(mind.Config.Reasoning.Ceiling),
+            ["budget"] = mind.Config.Reasoning.TokensFor(mind.Config.Reasoning.Level),
+            ["budgets"] = BudgetLadder(mind.Config.Reasoning.Ceiling,
+                mind.Config.Reasoning.TokensFor),
         };
         var capabilities = new Dictionary<string, object?>
         {
@@ -354,6 +397,7 @@ public static class LlamaCppGgufExporter
             ["version"] = 1,
             ["description"] = mind.Config.Description ?? string.Empty,
             ["thinking"] = thinking,
+            ["reasoning"] = reasoning,
             ["capabilities"] = capabilities,
             ["tools"] = new Dictionary<string, object?>
             {
@@ -362,27 +406,140 @@ public static class LlamaCppGgufExporter
                 ["names"] = toolNames,
             },
         });
-        writer.AddString("tokenizer.chat_template",
-            ChatTemplate(manifest.Replace("'", "\\u0027"),
-                Convert.ToBoolean(thinking["enabled"])));
+        // The template itself is GENERATED from the mind's live state (see
+        // Mind.GenerateChatTemplate) and self-verified against the built-in
+        // engine before it ships: a template that cannot render the mind's
+        // own format never reaches a GGUF.
+        var template = mind.GenerateChatTemplate(manifest.Replace("'", "\\u0027"));
+        ChatTemplateGenerator.VerifyExportedTemplate(template,
+            Convert.ToBoolean(thinking["enabled"]));
+        writer.AddString("cognify.chat_template.generator", ChatTemplateMeta.Generator);
+        writer.AddString("tokenizer.chat_template", template);
+    }
+
+    // ---- effort ladders (llama.cpp-aligned) ---------------------------------
+
+    /// <summary>
+    /// The level name llama.cpp's <c>--reasoning-effort</c> ladder uses for
+    /// this level: low, medium, high, xhigh (VeryHigh), max. Cognify's
+    /// thinking and reasoning levels map 1:1 onto it, so a client can pass
+    /// the exported level straight to <c>--reasoning-effort</c>.
+    /// </summary>
+    internal static string EffortName(ThinkingLevel level) => level switch
+    {
+        ThinkingLevel.Low => "low",
+        ThinkingLevel.Medium => "medium",
+        ThinkingLevel.High => "high",
+        ThinkingLevel.VeryHigh => "xhigh",
+        _ => "max"
+    };
+
+    /// <summary>
+    /// The effort levels this mind implements, lowest→highest, cut at the
+    /// ceiling — the same shape as llama.cpp's
+    /// <c>chat_template_caps.reasoning_effort_levels</c> in GET /props.
+    /// </summary>
+    internal static List<string> EffortLevels(ThinkingCeiling ceiling)
+    {
+        var levels = new List<string>();
+        foreach (ThinkingLevel level in Enum.GetValues<ThinkingLevel>())
+        {
+            if (level > ceiling.MaxLevel()) break;
+            levels.Add(EffortName(level));
+        }
+        return levels;
     }
 
     /// <summary>
-    /// Minimal Jinja chat template — llama.cpp's minja and Unsloth render it
-    /// when the file is served with <c>--jinja</c>: an optional OpenAI-style
-    /// tools block (rendered as JSON via <c>tojson</c>), then
-    /// <c>role: content</c> lines, ending on the assistant cue. Thinking
-    /// minds honor Qwen3's <c>enable_thinking</c> kwarg (sent as
-    /// <c>chat_template_kwargs</c> by UIs): false drops the "thought:" cue.
+    /// The token budget each implemented level buys — the ladder a client
+    /// needs to reproduce the mind's effort levels with
+    /// <c>--reasoning-budget</c> semantics (N>0 = token cap per cycle).
     /// </summary>
-    internal static string ChatTemplate(string manifestJson, bool thinkingEnabled) =>
-        "{%- set cognify_manifest = '" + manifestJson + "' %}\n" +
-        "{%- if tools %}tools: {{ tools | tojson }}\n" +
-        "{% endif %}{% for m in messages %}{{ m['role'] }}: {{ m['content'] }}\n" +
-        "{% endfor %}" +
-        (thinkingEnabled
-            ? "{%- if enable_thinking is defined and not enable_thinking %}assistant:{% else %}assistant: thought:{% endif %}"
-            : "assistant:");
+    internal static Dictionary<string, int> BudgetLadder(ThinkingCeiling ceiling,
+        Func<ThinkingLevel, int> tokensFor)
+    {
+        var ladder = new Dictionary<string, int>();
+        foreach (ThinkingLevel level in Enum.GetValues<ThinkingLevel>())
+        {
+            if (level > ceiling.MaxLevel()) break;
+            ladder[EffortName(level)] = tokensFor(level);
+        }
+        return ladder;
+    }
+
+    /// <summary>
+    /// The level name llama.cpp's <c>--reasoning-effort</c> ladder uses for
+    /// this <see cref="ReasoningLevel"/> — identical rungs to the thinking
+    /// mapping (low, medium, high, xhigh for VeryHigh, max).
+    /// </summary>
+    internal static string EffortName(ReasoningLevel level) => level switch
+    {
+        ReasoningLevel.Low => "low",
+        ReasoningLevel.Medium => "medium",
+        ReasoningLevel.High => "high",
+        ReasoningLevel.VeryHigh => "xhigh",
+        _ => "max"
+    };
+
+    /// <summary>
+    /// The reasoning effort levels this mind implements, lowest→highest, cut
+    /// at the reasoning ceiling — llama.cpp's
+    /// <c>chat_template_caps.reasoning_effort_levels</c> shape.
+    /// </summary>
+    internal static List<string> EffortLevels(ReasoningCeiling ceiling)
+    {
+        var levels = new List<string>();
+        foreach (ReasoningLevel level in Enum.GetValues<ReasoningLevel>())
+        {
+            if (level > ceiling.MaxLevel()) break;
+            levels.Add(EffortName(level));
+        }
+        return levels;
+    }
+
+    /// <summary>
+    /// The reasoning token budget each implemented level buys — the ladder a
+    /// client needs to reproduce the mind's effort levels with
+    /// <c>--reasoning-budget</c> semantics (N>0 = token cap per cycle).
+    /// </summary>
+    internal static Dictionary<string, int> BudgetLadder(ReasoningCeiling ceiling,
+        Func<ReasoningLevel, int> tokensFor)
+    {
+        var ladder = new Dictionary<string, int>();
+        foreach (ReasoningLevel level in Enum.GetValues<ReasoningLevel>())
+        {
+            if (level > ceiling.MaxLevel()) break;
+            ladder[EffortName(level)] = tokensFor(level);
+        }
+        return ladder;
+    }
+
+    /// <summary>A serving-stack sampling profile shipped as GGUF metadata.</summary>
+    internal sealed record SamplingProfile(
+        float Temperature, float TopP, uint TopK, float RepeatPenalty, uint MaxTokens);
+
+    /// <summary>
+    /// The sampling settings this model needs to produce clean output —
+    /// sized to the vocabulary, because a word-level model trained on a
+    /// small corpus degenerates into "what you is what you" loops at hot
+    /// temperatures with no repetition penalty, and has no learned sense of
+    /// when to stop:
+    /// <list type="bullet">
+    /// <item>&lt; 1k vocab pieces (greeting / toy scale): temp 0.7, repeat penalty 1.20, 128 max tokens.</item>
+    /// <item>&lt; 32k pieces (small chat model): temp 0.7, repeat penalty 1.15, 256 max tokens.</item>
+    /// <item>anything bigger: temp 0.8, repeat penalty 1.10, 512 max tokens.</item>
+    /// </list>
+    /// Top-k 40 / top-p 0.9 everywhere — wide enough for variety, narrow
+    /// enough to keep the sampling out of the long tail. Emitted as
+    /// <c>cognify.sampling.*</c> GGUF metadata so a serving stack can adopt
+    /// the profile instead of guessing.
+    /// </summary>
+    internal static SamplingProfile SamplingFor(int vocabSize) => vocabSize switch
+    {
+        < 1_000 => new SamplingProfile(0.7f, 0.9f, 40, 1.20f, 128),
+        < 32_768 => new SamplingProfile(0.7f, 0.9f, 40, 1.15f, 256),
+        _ => new SamplingProfile(0.8f, 0.9f, 40, 1.10f, 512)
+    };
 
     // ---- tokenizer ---------------------------------------------------------
 

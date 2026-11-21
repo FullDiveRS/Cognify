@@ -1376,19 +1376,34 @@ public sealed class TransformerLM
                 var cache = ForwardWindow(PadTokens([.. window]), training: false);
                 var logits = cache.Logits[t - 1];
 
-                // Temperature-scaled sampling over non-special tokens.
-                double max = logits.Skip(SpecialCount).Max();
+                // Temperature sampling over the real word tokens PLUS the
+                // end token — the stop behavior llama.cpp has (EOS is part
+                // of the distribution the model was trained to predict at
+                // sentence ends), so a finished sentence can end itself
+                // instead of always running to maxTokens. Pad/unk/bos stay
+                // excluded.
+                double max = double.NegativeInfinity;
+                for (int i = EosId; i < _vocab.Count; i++) max = Math.Max(max, logits[i]);
                 var probs = new double[_vocab.Count];
                 double sum = 0;
-                for (int i = SpecialCount; i < _vocab.Count; i++)
+                for (int i = EosId; i < _vocab.Count; i++)
                 {
                     probs[i] = Math.Exp((logits[i] - max) / Math.Max(0.05, temperature));
                     sum += probs[i];
                 }
+                // No-triple guard: never let a token land three times in a
+                // row — the one degenerate loop a tiny word-level model
+                // falls into ("what you is what you is …"). Doubles stay
+                // legal ("very very"); triples get re-sampled away.
+                if (ids.Count >= 2 && ids[^1] == ids[^2])
+                {
+                    sum -= probs[ids[^1]];
+                    probs[ids[^1]] = 0;
+                }
                 double r = _rng.NextDouble() * sum;
-                int chosen = SpecialCount;
+                int chosen = EosId;
                 double acc = 0;
-                for (int i = SpecialCount; i < _vocab.Count; i++)
+                for (int i = EosId; i < _vocab.Count; i++)
                 {
                     acc += probs[i];
                     if (r <= acc) { chosen = i; break; }
@@ -1399,6 +1414,57 @@ public sealed class TransformerLM
                 ids.Add(chosen);
             }
             return string.Join(" ", produced);
+        }
+    }
+
+    /// <summary>
+    /// Scores lines WITHOUT touching the weights or the observation buffer —
+    /// the validation half of a train/validation split. Builds the same
+    /// next-token windows training does (every contiguous subsequence of
+    /// each line, left-padded with bos) and averages the SAME cross-entropy
+    /// the training loop minimizes (full softmax over the vocabulary, every
+    /// window position) on a forward-only pass — so the number is directly
+    /// comparable to the deep-training report's loss. Returns (mean
+    /// nats/token, positions scored); the loss is NaN when the model is
+    /// untrained or nothing was scoreable.
+    /// </summary>
+    public (double Loss, int Tokens) Evaluate(IEnumerable<string> lines)
+    {
+        lock (_gate)
+        {
+            if (lines is null || _epochsTrained == 0) return (double.NaN, 0);
+            double nllSum = 0;
+            long positions = 0;
+            foreach (var line in lines)
+            {
+                if (string.IsNullOrWhiteSpace(line)) continue;
+                var ids = new List<int> { BosId };
+                foreach (var w in Tokenize(line)) ids.Add(EncodeWord(w));
+                ids.Add(EosId);
+
+                int len = ids.Count;
+                for (int st = 0; st < len - 1; st++)
+                {
+                    int maxE = Math.Min(len, st + 1 + _cfg.ContextLen);
+                    for (int e = st + 1; e < maxE; e++)
+                    {
+                        var x = new int[_cfg.ContextLen];
+                        int windowLen = e - st;
+                        int pad = _cfg.ContextLen - windowLen;
+                        for (int j = 0; j < pad; j++) x[j] = BosId;
+                        for (int j = 0; j < windowLen; j++) x[pad + j] = ids[st + j];
+
+                        var cache = ForwardWindow(x, training: false);
+                        for (int p = 0; p < _cfg.ContextLen; p++)
+                        {
+                            int y = p < _cfg.ContextLen - 1 ? x[p + 1] : ids[e];
+                            nllSum -= Math.Log(Math.Max(cache.Probs[p][y], 1e-12));
+                            positions++;
+                        }
+                    }
+                }
+            }
+            return positions == 0 ? (double.NaN, 0) : (nllSum / positions, (int)positions);
         }
     }
 
