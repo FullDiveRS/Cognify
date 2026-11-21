@@ -111,6 +111,25 @@ public sealed class Mind : IDisposable
     /// </summary>
     public ThinkingModule? Thinking => Module<ThinkingModule>();
 
+    /// <summary>
+    /// Sets the thinking TOKEN budget for ONE level at runtime — the ladder
+    /// from Low up to Max, or up to the ceiling's top level when a clamp is
+    /// set (the level is clamped first, so a Max budget on an Only2-capped
+    /// model lands on Medium). The level's budget sizes the generated
+    /// thought set (roughly tokens/50 thoughts, 1..10); under automatic
+    /// thinking the resolver only picks the level and this budget follows.
+    /// A global budget set through the options' <c>Budget(int)</c> wins
+    /// over per-level entries. Chains.
+    /// </summary>
+    public Mind SetThinkingBudget(ThinkingLevel level, int tokens)
+    {
+        Config.Thinking.Budget(level, tokens);
+        return this;
+    }
+
+    /// <summary>The thinking tokens the given level may spend right now.</summary>
+    public int ThinkingTokensFor(ThinkingLevel level) => Config.Thinking.TokensFor(level);
+
     /// <summary>Personality traits (null if personality is disabled).</summary>
     public BigFiveTraits? Personality => Module<PersonalityModule>()?.Traits;
 
@@ -503,12 +522,133 @@ public sealed class Mind : IDisposable
     /// Trains the mind from a corpus file: one utterance per line, blank
     /// lines and '#' comment lines are ignored. Returns the training report.
     /// </summary>
-    public TrainingReport TrainFile(string path)
+    /// <param name="path">Corpus file path.</param>
+    /// <param name="validationSplit">
+    /// Fraction of the file held OUT of training and scored instead — 0.2
+    /// trains on 80% and validates on the rest. The split is a deterministic
+    /// shuffle (seeded by <paramref name="splitSeed"/>) so the same file and
+    /// seed always hold out the same lines; the report carries the held-out
+    /// lines' cross-entropy under the trained transformer
+    /// (<see cref="TrainingReport.ValidationLoss"/>, nats/token — the same
+    /// metric deep training minimizes). Validation does NOT touch the
+    /// weights or the language buffer. 0 (default) trains on every line,
+    /// exactly like before.
+    /// </param>
+    /// <param name="splitSeed">Shuffle seed for the split; keep it fixed to
+    /// make runs comparable.</param>
+    public TrainingReport TrainFile(string path, double validationSplit = 0.0, int splitSeed = 42)
     {
         if (!File.Exists(path))
             throw new FileNotFoundException($"Training file not found: {path}", path);
-        return TrainAll(File.ReadAllLines(path)
-            .Where(l => !string.IsNullOrWhiteSpace(l) && !l.TrimStart().StartsWith("#")));
+        var lines = File.ReadAllLines(path)
+            .Where(l => !string.IsNullOrWhiteSpace(l) && !l.TrimStart().StartsWith("#"))
+            .ToList();
+
+        double split = double.IsNaN(validationSplit) ? 0 : Math.Clamp(validationSplit, 0.0, 0.5);
+        int holdOut = lines.Count >= 2 && split > 0
+            ? Math.Clamp((int)(lines.Count * split), 1, lines.Count - 1)
+            : 0;
+
+        var report = TrainAll(holdOut == 0 ? lines : lines.Take(lines.Count - holdOut));
+        report.ValidationSplit = split;
+        report.ValidationLines = holdOut;
+        if (holdOut > 0)
+        {
+            // Deterministic shuffle → the held-out lines are a random-but-
+            // reproducible sample, not the file's tail (corpus files are
+            // often ordered by topic; a tail split would skew validation).
+            var shuffled = new List<string>(lines);
+            var rng = new Random(splitSeed);
+            for (int i = shuffled.Count - 1; i > 0; i--)
+            {
+                int j = rng.Next(i + 1);
+                (shuffled[i], shuffled[j]) = (shuffled[j], shuffled[i]);
+            }
+
+            var (loss, tokens) = NeuralLanguageModel.Evaluate(shuffled.TakeLast(holdOut));
+            report.ValidationLoss = loss;
+            report.ValidationWords = tokens;
+        }
+        return report;
+    }
+
+    /// <summary>
+    /// Synthesizes this mind's OWN llama.cpp chat template from its live
+    /// state — thinking switch/level/ceiling, capabilities, tools, name and
+    /// description go into a provenance comment (renders nothing,
+    /// extractable from GET /props next to the manifest), and the format
+    /// core gets only the branches this mind needs: a tools block exists
+    /// only for minds with the tools capability, and the assistant cue
+    /// carries the Qwen3 enable_thinking kwarg handling only for minds that
+    /// can think. Deterministic; <see cref="ApplyChatTemplate"/> defaults to
+    /// exactly this, llama.cpp's minja accepts it, and the GGUF exporter
+    /// embeds it after a render self-verification. Pass
+    /// <paramref name="manifestJson"/> (the escaped capability-manifest JSON)
+    /// to also embed the <c>set</c> line the exported file carries.
+    /// </summary>
+    public string GenerateChatTemplate(string? manifestJson = null) =>
+        ChatTemplateGenerator.Generate(this, manifestJson);
+
+    /// <summary>
+    /// Renders a conversation through a Jinja chat template — the same
+    /// templates llama.cpp serves with --jinja (ChatML, Qwen3, Llama-3.1,
+    /// Zephyr, the mind's own exported one), rendered by the built-in engine
+    /// (<see cref="ChatJinja"/>, a minja-compatible subset — no external
+    /// dependency). Messages are role/content dictionaries or (role, content)
+    /// tuples; a null template uses the mind's own format — the one the GGUF
+    /// exporter embeds, minus the manifest line (that rides in the exported
+    /// file for GET /props). Extra variables become template context, so
+    /// Qwen3's enable_thinking=false drops the thinking cue; bos_token /
+    /// eos_token default to the mind's special tokens like llama-server does.
+    /// </summary>
+    public string ApplyChatTemplate(
+        IEnumerable<object?> messages,
+        string? template = null,
+        IEnumerable<Dictionary<string, object?>>? tools = null,
+        bool addGenerationPrompt = false,
+        IReadOnlyDictionary<string, object?>? extraVariables = null)
+    {
+        var normalized = new List<object?>();
+        foreach (var message in messages)
+        {
+            if (message is Dictionary<string, object?> dict)
+            {
+                normalized.Add(new Dictionary<string, object?>(dict, StringComparer.Ordinal));
+            }
+            else if (message is ValueTuple<string, object?> pair)
+            {
+                normalized.Add(new Dictionary<string, object?>(StringComparer.Ordinal)
+                {
+                    ["role"] = pair.Item1,
+                    ["content"] = pair.Item2,
+                });
+            }
+            else if (message is ValueTuple<string, string> pair2)
+            {
+                normalized.Add(new Dictionary<string, object?>(StringComparer.Ordinal)
+                {
+                    ["role"] = pair2.Item1,
+                    ["content"] = pair2.Item2,
+                });
+            }
+            else
+            {
+                throw new CognifyException(
+                    "chat template messages must be role/content dictionaries " +
+                    "or (role, content) tuples");
+            }
+        }
+        template ??= GenerateChatTemplate();
+        var variables = new Dictionary<string, object?>(StringComparer.Ordinal);
+        if (extraVariables is not null)
+            foreach (var pair in extraVariables) variables[pair.Key] = pair.Value;
+        variables.TryAdd("messages", normalized);
+        variables.TryAdd("bos_token", "<bos>");
+        variables.TryAdd("eos_token", "<eos>");
+        variables["add_generation_prompt"] = addGenerationPrompt;
+        if (tools is not null)
+            variables["tools"] = tools.ToList<object?>();
+        return ChatJinja.Render(template, variables);
     }
 
     private void TrainLine(string? raw, TrainingReport report)

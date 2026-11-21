@@ -78,11 +78,113 @@ public static class ThinkingCeilingExtensions
         level > ceiling.MaxLevel() ? ceiling.MaxLevel() : level;
 }
 
+/// <summary>
+/// How hard the mind reasons — the reasoning module's OWN ladder, mirroring
+/// <see cref="ThinkingLevel"/> rung for rung (Low, Medium, High, VeryHigh,
+/// Max) so the two modules line up level for level while each keeps its
+/// own type. The level sizes the forward-chaining depth
+/// (<see cref="ReasoningOptions.DepthFor"/>) and the explanation trace
+/// budget (<see cref="ReasoningOptions.TokensFor"/>).
+/// </summary>
+public enum ReasoningLevel
+{
+    /// <summary>A quick check — shallow chaining (2 inference passes).</summary>
+    Low,
+
+    /// <summary>The default: the historical chaining depth (6 passes).</summary>
+    Medium,
+
+    /// <summary>A real deduction (8 passes).</summary>
+    High,
+
+    /// <summary>Deep chaining (10 passes).</summary>
+    VeryHigh,
+
+    /// <summary>Maximum chaining (12 passes).</summary>
+    Max
+}
+
+/// <summary>
+/// How far the mind is ALLOWED to reason — the reasoning mirror of
+/// <see cref="ThinkingCeiling"/>: a hard cap the model builder sets at build
+/// time, with the same five presets (Only1 = Low only … Only5 = everything,
+/// the default). A level requested above the ceiling is silently clamped
+/// DOWN to the ceiling's top level, and the cap travels with the model into
+/// exported files (<c>cognify.reasoning.ceiling</c> GGUF metadata).
+/// </summary>
+public enum ReasoningCeiling
+{
+    /// <summary>Only 1: Low is the only allowed reasoning level.</summary>
+    Only1,
+    /// <summary>Only 2: Low or Medium.</summary>
+    Only2,
+    /// <summary>Only 3: Low, Medium or High.</summary>
+    Only3,
+    /// <summary>Only 4: Low, Medium, High or Very High.</summary>
+    Only4,
+    /// <summary>Only 5: Low, Medium, High, Very High or Max — no cap (default).</summary>
+    Only5
+}
+
+/// <summary>Helpers for <see cref="ReasoningCeiling"/>.</summary>
+public static class ReasoningCeilingExtensions
+{
+    /// <summary>
+    /// The highest <see cref="ReasoningLevel"/> the ceiling allows: Only1 → Low,
+    /// Only2 → Medium, Only3 → High, Only4 → VeryHigh, Only5 → Max.
+    /// </summary>
+    public static ReasoningLevel MaxLevel(this ReasoningCeiling ceiling) => ceiling switch
+    {
+        ReasoningCeiling.Only1 => ReasoningLevel.Low,
+        ReasoningCeiling.Only2 => ReasoningLevel.Medium,
+        ReasoningCeiling.Only3 => ReasoningLevel.High,
+        ReasoningCeiling.Only4 => ReasoningLevel.VeryHigh,
+        _ => ReasoningLevel.Max
+    };
+
+    /// <summary>
+    /// Clamps a requested level down to the ceiling. Levels at or below the
+    /// ceiling pass through untouched; anything above it lands on the
+    /// ceiling's top level.
+    /// </summary>
+    public static ReasoningLevel Clamp(this ReasoningCeiling ceiling, ReasoningLevel level) =>
+        level > ceiling.MaxLevel() ? ceiling.MaxLevel() : level;
+}
+
+/// <summary>
+/// Cross-ladder mappings — the reasoning and thinking ladders share rungs
+/// and order (Low=0 … Max=4, Only1=0 … Only5=4), so ONE cognitive level
+/// (<see cref="MindBuilder.WithCognitiveLevel"/>) drives both modules while
+/// each keeps its own typed ladder.
+/// </summary>
+public static class ReasoningLevelExtensions
+{
+    /// <summary>Maps a <see cref="ThinkingLevel"/> onto the reasoning ladder (same rung).</summary>
+    public static ReasoningLevel FromThinking(this ThinkingLevel level) => (ReasoningLevel)(int)level;
+
+    /// <summary>Maps a <see cref="ReasoningLevel"/> onto the thinking ladder (same rung).</summary>
+    public static ThinkingLevel ToThinking(this ReasoningLevel level) => (ThinkingLevel)(int)level;
+
+    /// <summary>Maps a <see cref="ThinkingCeiling"/> onto the reasoning ceiling (same preset).</summary>
+    public static ReasoningCeiling FromThinking(this ThinkingCeiling ceiling) => (ReasoningCeiling)(int)ceiling;
+}
+
 /// <summary>Options for the reasoning module.</summary>
 public sealed class ReasoningOptions
 {
-    /// <summary>Maximum forward-chaining depth (number of inference passes).</summary>
+    /// <summary>
+    /// Maximum forward-chaining depth (number of inference passes). Sized by
+    /// the level ladder (<see cref="DepthFor"/>) unless
+    /// <see cref="Depth(int)"/> pinned an explicit value.
+    /// </summary>
     public int MaxInferenceDepth { get; set; } = 6;
+
+    /// <summary>
+    /// True once <see cref="Depth(int)"/> pinned an explicit depth — the
+    /// level ladder then stops retuning it. Serialized with the config so
+    /// saved minds keep the pin.
+    /// </summary>
+    public bool DepthIsCustom { get; set; }
 
     /// <summary>How many co-occurrence observations are required before inducing a new fact.</summary>
     public double InductionThreshold { get; set; } = 5;
@@ -93,11 +195,168 @@ public sealed class ReasoningOptions
     /// <summary>Enable abduction (finding the best explanation for an observation).</summary>
     public bool AllowAbduction { get; set; } = true;
 
-    /// <summary>Fluent setter: <see cref="MaxInferenceDepth"/>.</summary>
-    public ReasoningOptions Depth(int value) { MaxInferenceDepth = value; return this; }
+    /// <summary>
+    /// The mind's own reasoning switch — can this model chain inferences at
+    /// all? False short-circuits the reasoning phase: facts already learned
+    /// stay queryable, but no new deduction / induction / abduction runs.
+    /// Mirrors the builder's <c>WithReasoning(..., enabled: false)</c> but
+    /// stays changeable at runtime through the options object — the GGUF
+    /// exporter reads it for <c>cognify.reasoning.enabled</c>, the same way
+    /// it reads <see cref="ThinkingOptions.Enabled"/>.
+    /// </summary>
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>
+    /// Fluent setter: <see cref="Enabled"/> — the same switch thinking's
+    /// <see cref="ThinkingOptions.Enable"/> flips, on reasoning's own side.
+    /// </summary>
+    public ReasoningOptions Enable(bool value) { Enabled = value; return this; }
+
+    /// <summary>
+    /// How hard the mind reasons (token-set size), on reasoning's OWN ladder
+    /// <see cref="ReasoningLevel"/> — rung for rung lined up with
+    /// <see cref="ThinkingOptions.Level"/>: the same five steps, the same
+    /// ceiling and the same default budgets — one call sets the effort of
+    /// both modules (see <see cref="MindBuilder.WithCognitiveLevel"/>). The
+    /// level sizes the inference depth (<see cref="DepthFor"/>) and the
+    /// explanation trace budget (<see cref="TokensFor"/>).
+    /// </summary>
+    public ReasoningLevel Level { get; set; } = ReasoningLevel.Medium;
+
+    /// <summary>
+    /// The hard cap on reasoning — the highest level this model may ever
+    /// use. Requests above the ceiling are clamped down at runtime; see
+    /// <see cref="ReasoningCeiling"/>.
+    /// </summary>
+    public ReasoningCeiling Ceiling { get; set; } = ReasoningCeiling.Only5;
+
+    /// <summary>
+    /// Explicit reasoning token budget overriding everything when greater
+    /// than zero: the token ceiling for the reasoning trace (the arithmetic,
+    /// lookup, inference and induction explanations) in ONE cycle. This is
+    /// the ONE budget for every level; for a per-level ladder use
+    /// <see cref="Budget(ReasoningLevel, int)"/> instead.
+    /// </summary>
+    public int TokenBudget { get; set; } = 0;
+
+    /// <summary>
+    /// The reasoning token budget per level — the ladder from Low up to Max,
+    /// or up to the ceiling's top level when a clamp is set. Defaults match
+    /// the thinking ladder exactly, so the two modules' budgets line up
+    /// level for level.
+    /// </summary>
+    public Dictionary<ReasoningLevel, int> LevelBudgets { get; set; } = new()
+    {
+        [ReasoningLevel.Low] = 50,
+        [ReasoningLevel.Medium] = 100,
+        [ReasoningLevel.High] = 200,
+        [ReasoningLevel.VeryHigh] = 300,
+        [ReasoningLevel.Max] = 400,
+    };
+
+    /// <summary>Fluent setter: <see cref="MaxInferenceDepth"/> — pins the depth against the level ladder.</summary>
+    public ReasoningOptions Depth(int value)
+    {
+        MaxInferenceDepth = Math.Clamp(value, 1, 32);
+        DepthIsCustom = true;
+        return this;
+    }
 
     /// <summary>Fluent setter: <see cref="InductionThreshold"/>.</summary>
     public ReasoningOptions InduceAfter(int value) { InductionThreshold = value; return this; }
+
+    /// <summary>
+    /// Fluent setter: <see cref="Ceiling"/> — caps how far this model may
+    /// ever reason; <see cref="Level"/> is re-clamped immediately (mirrors
+    /// <see cref="ThinkingOptions.UpTo"/>).
+    /// </summary>
+    public ReasoningOptions UpTo(ReasoningCeiling value)
+    {
+        Ceiling = value;
+        Level = Ceiling.Clamp(Level);
+        return this;
+    }
+
+    /// <summary>
+    /// Fluent setter: <see cref="Level"/> — clamped to <see cref="Ceiling"/>.
+    /// Re-sizes the inference depth from the level ladder unless an explicit
+    /// depth was pinned; the trace budget follows through
+    /// <see cref="TokensFor"/> at use time.
+    /// </summary>
+    public ReasoningOptions At(ReasoningLevel value)
+    {
+        Level = Ceiling.Clamp(value);
+        if (!DepthIsCustom) MaxInferenceDepth = DepthFor(Level);
+        return this;
+    }
+
+    /// <summary>Fluent setter: <see cref="TokenBudget"/> — ONE budget for every level.</summary>
+    public ReasoningOptions Budget(int tokens) { TokenBudget = Math.Max(0, tokens); return this; }
+
+    /// <summary>
+    /// Fluent setter: the reasoning token budget for ONE level — the ladder
+    /// from Low up to Max, or up to the ceiling's top level when a clamp is
+    /// set (the level is clamped at write time, so <c>Budget(Max, 600)</c>
+    /// with a ceiling of Only2 lands on Medium). Zero disables that level's
+    /// custom entry, falling back to the default ladder.
+    /// </summary>
+    public ReasoningOptions Budget(ReasoningLevel level, int tokens)
+    {
+        LevelBudgets ??= new Dictionary<ReasoningLevel, int>();
+        var clamped = Ceiling.Clamp(level);
+        if (tokens <= 0) LevelBudgets.Remove(clamped);
+        else LevelBudgets[clamped] = tokens;
+        return this;
+    }
+
+    /// <summary>
+    /// The reasoning tokens the given level may spend on its trace: a global
+    /// <see cref="TokenBudget"/> wins; otherwise the level (clamped by the
+    /// ceiling) is looked up in <see cref="LevelBudgets"/>, falling back to
+    /// the default ladder for entries a developer removed. Same resolution
+    /// rules as <see cref="ThinkingOptions.TokensFor"/>, so the two modules
+    /// line up level for level.
+    /// </summary>
+    public int TokensFor(ReasoningLevel level)
+    {
+        if (TokenBudget > 0) return TokenBudget;
+        var clamped = Ceiling.Clamp(level);
+        return LevelBudgets is not null &&
+               LevelBudgets.TryGetValue(clamped, out var tokens) && tokens > 0
+            ? tokens
+            : DefaultBudget(clamped);
+    }
+
+    /// <summary>The classic default ladder: Low 50 … Max 400 (same as thinking).</summary>
+    public static int DefaultBudget(ReasoningLevel level) => level switch
+    {
+        ReasoningLevel.Low => 50,
+        ReasoningLevel.Medium => 100,
+        ReasoningLevel.High => 200,
+        ReasoningLevel.VeryHigh => 300,
+        _ => 400
+    };
+
+    /// <summary>
+    /// The forward-chaining depth a level buys: Low 2 … Medium 6 … Max 12
+    /// passes. Medium keeps the historical default of 6, so existing minds
+    /// reason exactly as far as before; higher levels explore deeper.
+    /// </summary>
+    public static int DepthFor(ReasoningLevel level) => level switch
+    {
+        ReasoningLevel.Low => 2,
+        ReasoningLevel.Medium => 6,
+        ReasoningLevel.High => 8,
+        ReasoningLevel.VeryHigh => 10,
+        _ => 12
+    };
+
+    /// <summary>
+    /// The depth the next cycle will chain: an explicit
+    /// <see cref="Depth(int)"/> wins; otherwise the level ladder
+    /// (<see cref="DepthFor"/>) sizes it.
+    /// </summary>
+    public int EffectiveDepth => DepthIsCustom ? MaxInferenceDepth : DepthFor(Level);
 }
 
 /// <summary>Options for the thinking module.</summary>
@@ -139,10 +398,34 @@ public sealed class ThinkingOptions
     public string Tone { get; set; } = "balanced";
 
     /// <summary>
-    /// Explicit thinking token budget overriding <see cref="Level"/> when
-    /// greater than zero: roughly budget/50 generated thoughts (1..10).
+    /// Explicit thinking token budget overriding everything when greater
+    /// than zero: roughly budget/50 generated thoughts (1..10). This is the
+    /// ONE budget for every level; for a per-level ladder use
+    /// <see cref="Budget(ThinkingLevel, int)"/> instead.
     /// </summary>
     public int ThoughtBudget { get; set; } = 0;
+
+    /// <summary>
+    /// THINKING TOKEN BUDGETS PER LEVEL — how many thinking tokens each
+    /// level may spend, the ladder from Low up to Max (or up to the
+    /// <see cref="Ceiling"/>'s top level when a clamp is set; budgets above
+    /// the ceiling stay stored but are unreachable because every read
+    /// clamps the level first). Defaults reproduce the classic ladder
+    /// (50/100/200/300/400 → 1/2/4/6/8 thoughts). With
+    /// <see cref="Automatic"/> on, the automatic resolver only picks the
+    /// LEVEL — the chosen level's budget then sizes the thoughts, which is
+    /// why an explicit global <see cref="ThoughtBudget"/> suppresses the
+    /// choice while these do not. The setter exists for config
+    /// deserialization; guard against null there.
+    /// </summary>
+    public Dictionary<ThinkingLevel, int> LevelBudgets { get; set; } = new()
+    {
+        [ThinkingLevel.Low] = 50,
+        [ThinkingLevel.Medium] = 100,
+        [ThinkingLevel.High] = 200,
+        [ThinkingLevel.VeryHigh] = 300,
+        [ThinkingLevel.Max] = 400,
+    };
 
     /// <summary>
     /// THINKING AUTOMATIC — the mind chooses how much to think about each
@@ -179,6 +462,9 @@ public sealed class ThinkingOptions
             ThoughtBudget = ThoughtBudget,
             Automatic = Automatic,
         };
+        if (LevelBudgets is not null)
+            foreach (var kv in LevelBudgets)
+                copy.LevelBudgets[kv.Key] = kv.Value;
         return copy.At(level);
     }
 
@@ -222,29 +508,68 @@ public sealed class ThinkingOptions
     /// <summary>Fluent setter: <see cref="Tone"/>.</summary>
     public ThinkingOptions WithTone(string value) { Tone = value ?? "balanced"; return this; }
 
-    /// <summary>Fluent setter: <see cref="ThoughtBudget"/>.</summary>
+    /// <summary>Fluent setter: <see cref="ThoughtBudget"/> — ONE budget for every level.</summary>
     public ThinkingOptions Budget(int tokens) { ThoughtBudget = Math.Max(0, tokens); return this; }
+
+    /// <summary>
+    /// Fluent setter: the thinking token budget for ONE level — the ladder
+    /// from Low up to Max, or up to the ceiling's top level when a clamp is
+    /// set (the level is clamped at write time, so <c>Budget(Max, 600)</c>
+    /// with a ceiling of Only2 lands on Medium). Zero disables that level's
+    /// custom entry, falling back to the default ladder.
+    /// </summary>
+    public ThinkingOptions Budget(ThinkingLevel level, int tokens)
+    {
+        LevelBudgets ??= new Dictionary<ThinkingLevel, int>();
+        var clamped = Ceiling.Clamp(level);
+        if (tokens <= 0) LevelBudgets.Remove(clamped);
+        else LevelBudgets[clamped] = tokens;
+        return this;
+    }
+
+    /// <summary>
+    /// The thinking tokens the given level may spend: a global
+    /// <see cref="ThoughtBudget"/> wins; otherwise the level (clamped by the
+    /// ceiling) is looked up in <see cref="LevelBudgets"/>, falling back to
+    /// the default ladder for entries a developer removed.
+    /// </summary>
+    public int TokensFor(ThinkingLevel level)
+    {
+        if (ThoughtBudget > 0) return ThoughtBudget;
+        var clamped = Ceiling.Clamp(level);
+        return LevelBudgets is not null &&
+               LevelBudgets.TryGetValue(clamped, out var tokens) && tokens > 0
+            ? tokens
+            : DefaultBudget(clamped);
+    }
+
+    /// <summary>The classic default ladder: Low 50 … Max 400.</summary>
+    public static int DefaultBudget(ThinkingLevel level) => level switch
+    {
+        ThinkingLevel.Low => 50,
+        ThinkingLevel.Medium => 100,
+        ThinkingLevel.High => 200,
+        ThinkingLevel.VeryHigh => 300,
+        _ => 400
+    };
 
     /// <summary>Fluent setter: <see cref="Automatic"/>.</summary>
     public ThinkingOptions Auto(bool value = true) { Automatic = value; return this; }
 
     /// <summary>
     /// Generated-thought count for the current level/budget — the size of
-    /// the mind's "thinking token set" (1..10) per cycle.
+    /// the mind's "thinking token set" (1..10) per cycle. A global
+    /// <see cref="ThoughtBudget"/> overrides; otherwise the CURRENT level's
+    /// per-level budget decides (budget/50), so re-leveling re-sizes the
+    /// thought set — including under automatic thinking, where the resolver
+    /// picks the level and the level's budget follows.
     /// </summary>
     public int ThoughtRounds
     {
         get
         {
             if (ThoughtBudget > 0) return Math.Clamp(ThoughtBudget / 50, 1, 10);
-            return Ceiling.Clamp(Level) switch
-            {
-                ThinkingLevel.Low => 1,
-                ThinkingLevel.Medium => 2,
-                ThinkingLevel.High => 4,
-                ThinkingLevel.VeryHigh => 6,
-                _ => 8
-            };
+            return Math.Clamp(TokensFor(Level) / 50, 1, 10);
         }
     }
 }

@@ -295,6 +295,96 @@ public class TrainingTests : IDisposable
                         StringComparison.OrdinalIgnoreCase);
     }
 
+    // --------------------------------------------------- the validation split
+
+    [Fact]
+    public void TrainFile_Holds_Out_A_Validation_Split_And_Scores_It()
+    {
+        var mind = BuildMind();
+        var corpus = Path.Combine(Path.GetTempPath(), $"cognify-split-{Guid.NewGuid():N}.txt");
+        var lines = new List<string>();
+        for (int i = 0; i < 10; i++) lines.Add($"the little demo cat sat on mat number {i}");
+        File.WriteAllLines(corpus, lines);
+        try
+        {
+            mind.TrainFile(corpus);              // plain pass fills the language buffer
+            mind.TrainDeepModel(1);
+
+            var report = mind.TrainFile(corpus, 0.2, 42);
+            Assert.Equal(0.2, report.ValidationSplit);
+            Assert.Equal(2, report.ValidationLines);   // 10 * 0.2, floor
+            Assert.Equal(8, report.Lines);             // only the 80% trained
+            Assert.False(double.IsNaN(report.ValidationLoss));
+            Assert.True(report.ValidationWords > 0);
+            Assert.Contains("loss", report.ToString());
+
+            var plain = mind.TrainFile(corpus);  // no split — legacy behavior
+            Assert.Equal(0.0, plain.ValidationSplit);
+            Assert.Equal(0, plain.ValidationLines);
+            Assert.True(double.IsNaN(plain.ValidationLoss));
+            Assert.Equal(10, plain.Lines);
+        }
+        finally
+        {
+            File.Delete(corpus);
+        }
+    }
+
+    [Fact]
+    public void TrainFile_Split_Is_Deterministic_For_A_Seed()
+    {
+        var mind = BuildMind();
+        var corpus = Path.Combine(Path.GetTempPath(), $"cognify-split-{Guid.NewGuid():N}.txt");
+        var lines = new List<string>();
+        for (int i = 0; i < 10; i++) lines.Add($"deterministic seed line with exactly {i} unique markers");
+        File.WriteAllLines(corpus, lines);
+        try
+        {
+            mind.TrainFile(corpus);
+            mind.TrainDeepModel(1);
+
+            // Same seed → the same held-out lines → the same scored tokens.
+            var first = mind.TrainFile(corpus, 0.3, 7);
+            var second = mind.TrainFile(corpus, 0.3, 7);
+            Assert.Equal(first.ValidationWords, second.ValidationWords);
+            Assert.Equal(first.ValidationLines, second.ValidationLines);
+        }
+        finally
+        {
+            File.Delete(corpus);
+        }
+    }
+
+    [Fact]
+    public void Generate_Never_Repeats_A_Word_Three_Times_In_A_Row()
+    {
+        var mind = BuildMind();
+        var corpus = Path.Combine(Path.GetTempPath(), $"cognify-loop-{Guid.NewGuid():N}.txt");
+        // Deliberately degenerate: the model WILL want to chain "loop" forever.
+        var lines = new List<string>();
+        for (int i = 0; i < 6; i++) lines.Add("loop loop loop says hi today");
+        File.WriteAllLines(corpus, lines);
+        try
+        {
+            mind.TrainFile(corpus);
+            mind.TrainDeepModel(3);
+
+            for (int round = 0; round < 5; round++)
+            {
+                var words = mind.NeuralLanguageModel
+                    .Generate("loop", 30)
+                    .Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                for (int j = 0; j + 2 < words.Length; j++)
+                    Assert.False(words[j] == words[j + 1] && words[j + 1] == words[j + 2],
+                        $"triple repeat in generation: {string.Join(' ', words)}");
+            }
+        }
+        finally
+        {
+            File.Delete(corpus);
+        }
+    }
+
     private static string? FindCorpus()
     {
         var dir = new DirectoryInfo(AppContext.BaseDirectory);

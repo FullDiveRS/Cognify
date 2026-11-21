@@ -57,11 +57,41 @@ public sealed class MindBuilder
     // Capability toggles
     // ------------------------------------------------------------------
 
-    /// <summary>Enables the reasoning module (facts, rules, deduction / induction / abduction).</summary>
-    public MindBuilder WithReasoning(Action<ReasoningOptions>? configure = null, bool enabled = true)
+    /// <summary>
+    /// Enables the reasoning module (facts, rules, deduction / induction /
+    /// abduction) and gives it its own ceiling on reasoning's OWN ladder
+    /// (<see cref="ReasoningCeiling"/>, the mirror of the thinking one):
+    /// <c>Only1</c> = Low only, … <c>Only5</c> = everything (default). The
+    /// cap is exported with the model (<c>cognify.reasoning.ceiling</c>), so
+    /// serving stacks can read it.
+    /// </summary>
+    public MindBuilder WithReasoning(Action<ReasoningOptions>? configure = null, bool enabled = true,
+        ReasoningCeiling ceiling = ReasoningCeiling.Only5)
     {
         _enabled["reasoning"] = enabled;
+        _config.Reasoning.UpTo(ceiling);
+        _config.Reasoning.Enabled = enabled;   // keep the flag truthful — the GGUF exporter reads it
         configure?.Invoke(_config.Reasoning);
+        return this;
+    }
+
+    /// <summary>
+    /// Sets the cognitive effort for the WHOLE mind in one call: the
+    /// thinking level AND the reasoning level, each only when that module is
+    /// enabled in this builder. Reasoning owns its own
+    /// <see cref="ReasoningLevel"/> ladder — rung for rung identical to the
+    /// thinking one — so the requested level maps 1:1 onto both (and the
+    /// ceiling maps onto <see cref="ReasoningCeiling"/>). One level lines up
+    /// the effort of both: <c>.WithReasoning().WithThinking()
+    /// .WithCognitiveLevel(ThinkingLevel.High)</c> thinks at High AND chains
+    /// inferences at High (depth 8, 200-token trace).
+    /// </summary>
+    public MindBuilder WithCognitiveLevel(ThinkingLevel level, ThinkingCeiling ceiling = ThinkingCeiling.Only5)
+    {
+        if (_enabled.TryGetValue("thinking", out var thinking) && thinking)
+            _config.Thinking.UpTo(ceiling).At(level);
+        if (_enabled.TryGetValue("reasoning", out var reasoning) && reasoning)
+            _config.Reasoning.UpTo(ceiling.FromThinking()).At(level.FromThinking());
         return this;
     }
 
