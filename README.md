@@ -1,5 +1,3 @@
-## this project was made by GLM 5.3 FLASH, you may use it, study it or fork it as long as it retains the MIT license
-
 # Cognify
 
 > **Full documentation:** [`docs/DOCUMENTATION.md`](docs/DOCUMENTATION.md) — the complete reference (builder API, capabilities, the training loop, GGUF export, serving, troubleshooting).
@@ -277,7 +275,16 @@ lm.Observe("some training text");
 lm.Train(epochs: 30);
 ```
 
-The transformer persists with the mind's snapshot (SQLite `deeplangmodel` table) — **weights, vocabulary, training buffer and architecture**, so a restored mind keeps her exact neural configuration. When trained, her transformer weights also export into GGUF/safetensors as `cognify.transformer.*` tensors. Deep-learning specifics are up to you: everything above is configurable through `TransformerConfig` (dim, heads, layers, context length, dropout, learning rate, batch size, gradient clipping).
+The transformer persists with the mind's snapshot (SQLite `deeplangmodel` table) — **weights, vocabulary, training buffer and architecture**, so a restored mind keeps her exact neural configuration. When trained, her transformer weights also export into GGUF/safetensors as `cognify.transformer.*` tensors. Deep-learning specifics are up to you: everything above is configurable through `TransformerConfig` (dim, heads, layers, context length, dropout, learning rate, batch size, gradient clipping) and the `WithTransformer(c => ...)` builder hook.
+
+**Loop Transformer** — `TransformerConfig.Loop` (1–8, default 1) applies the block stack N times per forward pass: weight-tied recurrent depth (Universal Transformer / ALBERT style). `Loop = 2` with `Layers = 1` runs ONE block's weights twice — the same parameter count, twice the effective depth; gradients sum over every application, so looping trains exactly like a deeper tied stack. Snapshots carry it, and the llama.cpp export unrolls it into `Layers × Loop` physical blocks (`cognify.transformer.loop` records the logical stack):
+
+```csharp
+using var mind = MindBuilder.Create("Fino")
+    .WithMemory()
+    .WithTransformer(c => c with { Layers = 1, Loop = 2 })   // 1 block, applied twice
+    .Build();
+```
 
 ### Self-improvement — she learns from how you react
 A dedicated module that studies the conversation and gets better from it — no teacher required:

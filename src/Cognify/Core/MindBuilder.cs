@@ -178,6 +178,22 @@ public sealed class MindBuilder
         return this;
     }
 
+    /// <summary>
+    /// Configures the mind's neural language model architecture — the tiny
+    /// GPT-style transformer that deep-trains on her observations and gets
+    /// exported to llama.cpp. The hook for everything beyond the default:
+    /// dims, heads, layers, context, seed, and the Loop Transformer
+    /// (<c>Loop = 2</c> runs one block stack twice per pass — weight-tied
+    /// recurrent depth, more "thinking" per token without more parameters).
+    /// The model trains lazily from conversation or <c>TrainFile</c>, exactly
+    /// like the default one; only the shape differs. Call before Build().
+    /// </summary>
+    public MindBuilder WithTransformer(Func<Cognify.Learning.TransformerConfig, Cognify.Learning.TransformerConfig> configure)
+    {
+        _config.Transformer = configure(_config.Transformer ?? new Cognify.Learning.TransformerConfig());
+        return this;
+    }
+
     /// <summary>Enables the goal module (drives, goals, planning).</summary>
     public MindBuilder WithGoals(Action<GoalOptions>? configure = null, bool enabled = true)
     {
