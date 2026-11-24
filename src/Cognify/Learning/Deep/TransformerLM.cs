@@ -20,6 +20,17 @@ public sealed record TransformerConfig
     /// <summary>Transformer blocks stacked vertically (the model's depth).</summary>
     public int Layers { get; init; } = 2;
 
+    /// <summary>
+    /// Loop Transformer: how many times the block stack is applied per
+    /// forward pass (weight-tied recurrent depth — Universal Transformer /
+    /// ALBERT style). Loop = 2 with Layers = 1 runs ONE block's weights
+    /// twice: the same parameter count, twice the effective depth — the
+    /// model "thinks longer" per token without growing. Gradients sum over
+    /// every application, so looping trains exactly like a deeper stack
+    /// with tied weights. 1 (default) is the classic one-pass architecture.
+    /// </summary>
+    public int Loop { get; init; } = 1;
+
     /// <summary>Maximum context window in tokens (also the positional table size).</summary>
     public int ContextLen { get; init; } = 16;
 
@@ -161,6 +172,8 @@ public sealed class TransformerLM
             throw new ArgumentException("TransformerConfig dimensions must be positive (ContextLen > 2).");
         if (_cfg.Dim % _cfg.Heads != 0)
             throw new ArgumentException($"Dim ({_cfg.Dim}) must be divisible by Heads ({_cfg.Heads}).");
+        if (_cfg.Loop < 1 || _cfg.Loop > 8)
+            throw new ArgumentException($"Loop ({_cfg.Loop}) must be between 1 and 8 (1 = classic architecture).");
         _rng = new Random(_cfg.Seed);
         Allocate();
     }
@@ -635,12 +648,19 @@ public sealed class TransformerLM
         cache.X0 = x0;
 
         double[][] a = x0;
-        foreach (var block in _blocks)
+        // Loop Transformer: the block stack runs <see cref="TransformerConfig.Loop"/>
+        // times per pass — one LayerCache per APPLICATION (the backward pass
+        // needs every application's activations), while the weights stay the
+        // shared stack's (gradients accumulate into each block's slot).
+        for (int loop = 0; loop < _cfg.Loop; loop++)
         {
-            var lc = new LayerCache { XIn = a };
-            ForwardBlock(block, lc, training);
-            a = lc.XOut;
-            cache.Layers.Add(lc);
+            foreach (var block in _blocks)
+            {
+                var lc = new LayerCache { XIn = a };
+                ForwardBlock(block, lc, training);
+                a = lc.XOut;
+                cache.Layers.Add(lc);
+            }
         }
 
         // Final LayerNorm.
@@ -890,10 +910,14 @@ public sealed class TransformerLM
         // Final LayerNorm backward.
         var dFinal = LayerNormBackward(dLnF, cache.LnFHat, _lnFG, cache.LnFInvStd, g.GLnFG, g.GLnFB);
 
-        // Blocks, top-down; the gradient entering block l+1 is block l's output grad.
+        // Blocks, top-down; the gradient entering one application is the
+        // previous application's output grad. cache.Layers holds one entry
+        // per APPLICATION (stack × loop); application l used block
+        // (l % blockCount), and every application's gradients accumulate
+        // into that block's shared slot — weight-tied depth, exactly.
         var dUp = dFinal;
-        for (int l = _blocks.Length - 1; l >= 0; l--)
-            dUp = BackwardBlock(_blocks[l], cache.Layers[l], dUp, g.Blocks[l], g);
+        for (int l = cache.Layers.Count - 1; l >= 0; l--)
+            dUp = BackwardBlock(_blocks[l % _blocks.Length], cache.Layers[l], dUp, g.Blocks[l % _blocks.Length], g);
 
         // Embedding gradients: X0[p] = Wte[tok] + Wpe[p].
         for (int p = 0; p < t; p++)
@@ -1495,6 +1519,7 @@ public sealed class TransformerLM
         public int Dim { get; set; }
         public int Heads { get; set; }
         public int Layers { get; set; }
+        public int Loop { get; set; } = 1;   // 0 in pre-loop payloads → classic architecture
         public int ContextLen { get; set; }
         public int FfnMult { get; set; }
         public double Dropout { get; set; }
@@ -1556,6 +1581,7 @@ public sealed class TransformerLM
             return new TransformerConfig
             {
                 Dim = dto.Dim, Heads = dto.Heads, Layers = dto.Layers,
+                Loop = dto.Loop == 0 ? 1 : dto.Loop,
                 ContextLen = dto.ContextLen, FfnMult = dto.FfnMult,
                 Dropout = dto.Dropout, LearningRate = dto.LearningRate,
                 Seed = dto.Seed, MaxVocab = dto.MaxVocab,
@@ -1574,7 +1600,7 @@ public sealed class TransformerLM
         {
             var dto = new LmDto
             {
-                Dim = _cfg.Dim, Heads = _cfg.Heads, Layers = _cfg.Layers,
+                Dim = _cfg.Dim, Heads = _cfg.Heads, Layers = _cfg.Layers, Loop = _cfg.Loop,
                 ContextLen = _cfg.ContextLen, FfnMult = _cfg.FfnMult,
                 Dropout = _cfg.Dropout, LearningRate = _cfg.LearningRate,
                 Seed = _cfg.Seed, MaxVocab = _cfg.MaxVocab,
@@ -1616,7 +1642,7 @@ public sealed class TransformerLM
             if (dto?.Vocab is null || dto.Wte is null || dto.Wpe is null || dto.Blocks is null)
                 return false;
             if (dto.Dim != _cfg.Dim || dto.Heads != _cfg.Heads || dto.Layers != _cfg.Layers ||
-                dto.ContextLen != _cfg.ContextLen)
+                (dto.Loop == 0 ? 1 : dto.Loop) != _cfg.Loop || dto.ContextLen != _cfg.ContextLen)
                 return false;
 
             lock (_gate)

@@ -108,6 +108,8 @@ public static class LlamaCppGgufExporter
 
         int dim = cfg.Dim;
         int layers = cfg.Layers;
+        int loop = Math.Max(1, cfg.Loop);
+        int physicalLayers = layers * loop;   // Loop Transformer: unrolled for llama.cpp
         int heads = cfg.Heads;
 
         var wte = tensors[$"{Prefix}wte"];                       // [V][D]
@@ -154,7 +156,7 @@ public static class LlamaCppGgufExporter
 
         writer.AddUInt32("gpt2.context_length", (uint)context);
         writer.AddUInt32("gpt2.embedding_length", (uint)dim);
-        writer.AddUInt32("gpt2.block_count", (uint)layers);
+        writer.AddUInt32("gpt2.block_count", (uint)physicalLayers);
         writer.AddUInt32("gpt2.feed_forward_length", (uint)ffn);
         writer.AddUInt32("gpt2.attention.head_count", (uint)heads);
         writer.AddFloat32("gpt2.attention.layer_norm_epsilon", 1e-5f);
@@ -197,13 +199,23 @@ public static class LlamaCppGgufExporter
         writer.AddFloat32("cognify.sampling.repeat_penalty", sampling.RepeatPenalty);
         writer.AddUInt32("cognify.sampling.max_tokens", sampling.MaxTokens);
         writer.AddUInt32("cognify.cycles", (uint)mind.CycleCount);
+        // Loop Transformer provenance: the runtime runs ONE stack `loop`
+        // times (weight-tied); the GGUF materializes layers × loop physical
+        // blocks (an unrolled model computes exactly the same function, and
+        // llama.cpp has no weight tying across blocks). `layers` records the
+        // logical stack the weights came from.
+        writer.AddUInt32("cognify.transformer.layers", (uint)layers);
+        writer.AddUInt32("cognify.transformer.loop", (uint)loop);
 
         Add(new TensorSpec("token_embd.weight", wte.Data, wte.Shape));      // [V][D], tied output head
         Add(new TensorSpec("position_embd.weight", wpeData, wpeShape));   // [C][D], interpolated when requested
 
-        for (int l = 0; l < layers; l++)
+        for (int l = 0; l < physicalLayers; l++)
         {
-            string p = $"{Prefix}l{l}.";
+            // Unroll: physical layer l carries the weights of logical block
+            // (l % layers) — every application of the looped stack becomes
+            // its own block in the GGUF.
+            string p = $"{Prefix}l{l % layers}.";
             Add(new TensorSpec($"blk.{l}.attn_norm.weight", tensors[$"{p}ln1.g"].Data, dim));
             Add(new TensorSpec($"blk.{l}.attn_norm.bias", tensors[$"{p}ln1.b"].Data, dim));
             Add(FuseQkv($"blk.{l}.attn_qkv.weight",
@@ -257,11 +269,11 @@ public static class LlamaCppGgufExporter
                 report.Render());
 
         int tensorCount = written.Count;
-        if (tensorCount != 2 + layers * 12 + 2)
+        if (tensorCount != 2 + physicalLayers * 12 + 2)
             throw new InvalidOperationException(
-                $"export self-check failed: wrote {tensorCount} tensors, expected {2 + layers * 12 + 2}");
+                $"export self-check failed: wrote {tensorCount} tensors, expected {2 + physicalLayers * 12 + 2}");
         return new LlamaCppGgufResult(fullPath, tensorCount, vocabSize, dim, heads,
-            layers, context, ffn, new FileInfo(fullPath).Length);
+            physicalLayers, context, ffn, new FileInfo(fullPath).Length);
     }
 
     /// <summary>

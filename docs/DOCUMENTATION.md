@@ -324,7 +324,9 @@ From-scratch, dependency-free, pure C#/Python:
 | `HybridNextToken` | the blend: n-gram exactness + transformer generalization; an untrained transformer degrades gracefully to pure n-gram |
 | `AdamOptimizer` | the shared Adam implementation |
 
-`TransformerConfig` defaults (both sides): `Dim = 32`, `Heads = 4`, `Layers = 2`, `ContextLen = 16`, `FfnMult = 4`, `Dropout = 0.1`, `LearningRate = 3e-3`, `Seed = 42`, `MaxVocab = 2048`, `BatchSize = 16`, `MaxWindowsPerEpoch = 512` (Python: 96), `GradClip = 1.0`. The transformer **trains lazily** — automatically once ~600 new tokens (`AutoTrainTokens = 600`, `AutoTrainEpochs = 6`) have accumulated, or explicitly via `mind.TrainDeepModel(...)`. Weights persist in the snapshot; when trained they also export as `cognify.transformer.*` GGUF/safetensors tensors (§8).
+`TransformerConfig` defaults (both sides): `Dim = 32`, `Heads = 4`, `Layers = 2`, `ContextLen = 16`, `FfnMult = 4`, `Loop = 1`, `Dropout = 0.1`, `LearningRate = 3e-3`, `Seed = 42`, `MaxVocab = 2048`, `BatchSize = 16`, `MaxWindowsPerEpoch = 512` (Python: 96), `GradClip = 1.0`. The transformer **trains lazily** — automatically once ~600 new tokens (`AutoTrainTokens = 600`, `AutoTrainEpochs = 6`) have accumulated, or explicitly via `mind.TrainDeepModel(...)`. Weights persist in the snapshot; when trained they also export as `cognify.transformer.*` GGUF/safetensors tensors (§8).
+
+**The Loop Transformer** (`TransformerConfig.Loop`, 1–8, default 1) — weight-tied recurrent depth (Universal Transformer / ALBERT style): the block stack is applied `Loop` times per forward pass, so `Loop = 2` with `Layers = 1` runs ONE block's weights twice — the same parameter count, twice the effective depth. The model "thinks longer" per token without growing, and gradients sum over every application so looping trains exactly like a deeper stack with tied weights. Configure it through the builder (`WithTransformer` / `with_transformer`); snapshots carry it (a one-pass model refuses a looped snapshot and vice versa), and the llama.cpp export unrolls it into `Layers × Loop` physical blocks — an unrolled model computes exactly the same function, and llama.cpp has no weight tying across blocks (`gpt2.block_count` reports the unrolled count; `cognify.transformer.layers` / `cognify.transformer.loop` record the logical stack, §8).
 
 ```csharp
 var report = mind.TrainDeepModel(epochs: 20);
@@ -334,6 +336,13 @@ var net = new DeepNet(16, [32, 32], 4, DeepActivation.GELU, DeepOutput.Softmax, 
 net.Train(X, classLabels, epochs: 100, learningRate: 0.01);
 var lm = new TransformerLM(new TransformerConfig { Dim = 48, Layers = 3, ContextLen = 24 });
 lm.Observe("some training text"); lm.Train(epochs: 30);
+
+// Loop Transformer: one 1-block stack, looped twice — same parameters as
+// Layers = 1, twice the effective depth.
+using var loopedMind = MindBuilder.Create("Fino")
+    .WithMemory()
+    .WithTransformer(c => c with { Layers = 1, Loop = 2 })
+    .Build();
 ```
 
 ### 5.8 Self-improvement — learning from reactions
@@ -553,7 +562,7 @@ MindExporter.ExportTokenizer(mind, "tokenizer/");               // HF WordPiece 
 
 Export APIs take a **file** path; an existing directory target writes the file inside it named after the mind, and missing parents are created (no raw `UnauthorizedAccessException`). The runnable GGUF needs a **trained** transformer — call `mind.TrainDeepModel(...)` explicitly before exporting unless real conversation has already triggered the lazy pass.
 
-**The llama.cpp-runnable GGUF** maps the transformer onto the **stock `gpt2` architecture**: exact llama.cpp tensor names (`token_embd.weight`, `position_embd.weight`, `blk.N.attn_norm`, `blk.N.attn_qkv` fused as GPT-2's `c_attn`, `blk.N.attn_output`, `blk.N.ffn_up`, `blk.N.ffn_down`, `output_norm`; weight-tied output head omitted), a full `tokenizer.ggml` set (byte-unicode `Ġ` tokens, i32 token types, special ids, BPE merges) so prompt encoding reaches the word ids she trained with, and **post-write self-verification**: every file is re-read, compared value-for-value and linted against the gpt2 loader conformance rules — a broken export fails at export time, not inside llama.cpp.
+**The llama.cpp-runnable GGUF** maps the transformer onto the **stock `gpt2` architecture**: exact llama.cpp tensor names (`token_embd.weight`, `position_embd.weight`, `blk.N.attn_norm`, `blk.N.attn_qkv` fused as GPT-2's `c_attn`, `blk.N.attn_output`, `blk.N.ffn_up`, `blk.N.ffn_down`, `output_norm`; weight-tied output head omitted), a full `tokenizer.ggml` set (byte-unicode `Ġ` tokens, i32 token types, special ids, BPE merges) so prompt encoding reaches the word ids she trained with, and **post-write self-verification**: every file is re-read, compared value-for-value and linted against the gpt2 loader conformance rules — a broken export fails at export time, not inside llama.cpp. A Loop Transformer mind exports **unrolled**: `Layers × Loop` physical `blk.N` blocks (llama.cpp has no weight tying across blocks; an unrolled model computes exactly the same function), with `gpt2.block_count` = the unrolled count and `cognify.transformer.layers` / `cognify.transformer.loop` recording the logical stack it came from.
 
 **Context length and the "Total x / 16" readout** — `gpt2.context_length` equals the trained window (`TransformerConfig.ContextLen`, default 16: the learned absolute position embeddings bake it into the weights). `ExportOptions.LlamaCppContextLength = 128` stretches it by linear position interpolation (pi-style), so Unsloth/llama.cpp show /128 and `llama-server -c 128` works; coherence degrades the further past the trained range you push. Per-completion length is a request-time knob, not a weight: `n_predict` on the command line, `max_tokens` in the OpenAI-compatible API / Unsloth's max-tokens field.
 

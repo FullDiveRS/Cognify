@@ -1060,6 +1060,14 @@ public sealed class MindConfig
     /// <summary>Self-learning options.</summary>
     public LearningOptions Learning { get; set; } = new();
 
+    /// <summary>
+    /// Transformer architecture for the neural language model — null (the
+    /// default) builds the tiny stock model; set through
+    /// <c>MindBuilder.WithTransformer(...)</c> to pick dims, heads, layers,
+    /// context, seed or the Loop Transformer recurrence.
+    /// </summary>
+    public Cognify.Learning.TransformerConfig? Transformer { get; set; }
+
     /// <summary>Emotion options.</summary>
     public EmotionOptions Emotions { get; set; } = new();
 

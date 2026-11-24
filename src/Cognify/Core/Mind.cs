@@ -32,6 +32,7 @@ public sealed class Mind : IDisposable
         Config = config ?? throw new ArgumentNullException(nameof(config));
         Id = $"mind-{Guid.NewGuid():N}";
         _random = new Random(seed);
+        NeuralLanguageModel = new TransformerLM(config.Transformer);
         _modules.AddRange(modules);
         foreach (var m in _modules) m.Attach(this);
         _modules.Sort((a, b) => a.Order.CompareTo(b.Order));
@@ -188,7 +189,9 @@ public sealed class Mind : IDisposable
     /// Prediction blends both models through <see cref="Cognify.Learning.HybridNextToken"/>.
     /// Persists with the mind's snapshot.
     /// </summary>
-    public Cognify.Learning.TransformerLM NeuralLanguageModel { get; internal set; } = new();
+    public Cognify.Learning.TransformerLM NeuralLanguageModel { get; internal set; }
+
+    // Built once per mind from Config.Transformer (null = the tiny default).
 
     /// <summary>Self-improvement system (null if learning is disabled).</summary>
     public Cognify.Learning.SelfImprovementModule? SelfImprovement =>
